@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Simple Folder Silhouette -->
+  <path d="M 10 18 C 10 16 12 14 14 14 L 26 14 C 28 14 30 16 32 18 L 34 22 L 50 22 C 52 22 54 24 54 26 L 54 48 C 54 50 52 52 50 52 L 14 52 C 12 52 10 50 10 48 Z" fill="#FFFFFF"/>
+  <line x1="10" y1="28" x2="54" y2="28" stroke="#000000" stroke-width="2.5"/>
+</svg>

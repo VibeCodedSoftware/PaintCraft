@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Simple Clone Stamp Silhouette -->
+  <circle cx="32" cy="14" r="6.5" fill="#FFFFFF"/>
+  <path d="M 29 20 L 29 33 L 16 33 L 16 41 L 48 41 L 48 33 L 35 33 L 35 20 Z" fill="#FFFFFF"/>
+  <circle cx="32" cy="53" r="5.5" fill="none" stroke="#FFFFFF" stroke-width="2"/>
+  <circle cx="32" cy="53" r="1.8" fill="#FFFFFF"/>
+</svg>

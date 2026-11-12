@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Simple Shader Ball Silhouette -->
+  <circle cx="30" cy="34" r="17" fill="none" stroke="#FFFFFF" stroke-width="3.5"/>
+  <path d="M 22 24 A 11 11 0 0 0 38 40" fill="none" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="47" y1="12" x2="47" y2="24" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="41" y1="18" x2="53" y2="18" stroke="#FFFFFF" stroke-width="2.5" stroke-linecap="round"/>
+  <circle cx="47" cy="18" r="2" fill="#FFFFFF"/>
+</svg>

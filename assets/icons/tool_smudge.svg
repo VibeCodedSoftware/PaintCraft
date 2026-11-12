@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Simple Smudge Finger Silhouette -->
+  <path d="M 14 50 C 12 48 13 42 18 36 L 35 19 C 38 16 43 16 46 19 C 49 22 49 27 46 30 L 33 43 C 27 49 18 52 14 50 Z" fill="#FFFFFF"/>
+  <path d="M 42 12 C 48 15 54 21 56 28" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 48 8 C 54 12 60 18 61 24" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/>
+</svg>

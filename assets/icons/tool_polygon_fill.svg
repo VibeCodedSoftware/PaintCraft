@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Simple Paint Bucket Fill Silhouette -->
+  <path d="M 16 26 L 30 12 C 32 10 36 10 38 12 L 48 22 C 50 24 50 28 48 30 L 34 44 C 32 46 28 46 26 44 L 16 34 C 14 32 14 28 16 26 Z" fill="#FFFFFF"/>
+  <path d="M 12 30 L 28 46" stroke="#FFFFFF" stroke-width="3" stroke-linecap="round"/>
+  <path d="M 21 48 C 21 44 25 38 25 38 C 25 38 29 44 29 48 C 29 50 27 52 25 52 C 23 52 21 50 21 48 Z" fill="#FFFFFF"/>
+  <polygon points="36,54 52,36 58,52" fill="none" stroke="#FFFFFF" stroke-width="2.5" stroke-linejoin="round"/>
+</svg>

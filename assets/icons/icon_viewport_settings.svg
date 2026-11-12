@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Simple Viewport Settings Gear Silhouette -->
+  <path d="M 28 10 L 36 10 L 37 16 C 39 17 41 18 43 20 L 49 18 L 53 24 L 49 29 C 50 30 50 32 50 34 L 54 39 L 50 45 L 44 43 C 42 45 40 46 38 47 L 36 54 L 28 54 L 26 47 C 24 46 22 45 20 43 L 14 45 L 10 39 L 14 34 C 14 32 14 30 15 29 L 11 24 L 15 18 L 21 20 C 23 18 25 17 27 16 Z" fill="#FFFFFF"/>
+  <circle cx="32" cy="32" r="7.5" fill="#000000"/>
+</svg>

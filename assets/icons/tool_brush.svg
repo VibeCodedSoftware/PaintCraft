@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Simple Paintbrush Silhouette -->
+  <path d="M 14 50 C 12 48 12 44 14 42 L 33 23 L 41 31 L 22 50 C 20 52 16 52 14 50 Z" fill="#FFFFFF"/>
+  <path d="M 33 23 L 39 17 C 41 15 44 15 46 17 L 47 18 C 49 20 49 23 47 25 L 41 31 Z" fill="#FFFFFF"/>
+  <path d="M 39 17 L 47 25 L 53 15 C 55 12 55 9 51 9 C 47 9 44 12 39 17 Z" fill="#FFFFFF"/>
+</svg>

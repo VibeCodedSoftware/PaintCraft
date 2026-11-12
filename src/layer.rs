@@ -1,0 +1,4357 @@
+use rayon::prelude::*;
+
+// 3D Paintcraft - Multi-channel Layer System & Compositor
+// Pure safe Rust
+
+use crate::channel::{ChannelFlags, ChannelType, RgbaBuffer, ScalarBuffer};
+use crate::utils::NoiseGenerator;
+use glam::{Vec3, Vec4};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlendMode {
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Add,
+    Subtract,
+    Darken,
+    Lighten,
+    Replace,
+    PassThrough,
+}
+
+impl BlendMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Multiply => "Multiply",
+            Self::Screen => "Screen",
+            Self::Overlay => "Overlay",
+            Self::Add => "Linear Dodge (Add)",
+            Self::Subtract => "Subtract",
+            Self::Darken => "Darken",
+            Self::Lighten => "Lighten",
+            Self::Replace => "Replace",
+            Self::PassThrough => "Pass Through",
+        }
+    }
+
+    #[inline]
+    pub fn blend_color(&self, dst: Vec4, src: Vec4, opacity: f32) -> Vec4 {
+        let eff_alpha = opacity.clamp(0.0, 1.0);
+        if eff_alpha <= 1e-5 {
+            return dst;
+        }
+
+        let blended_rgb = match self {
+            Self::Normal | Self::PassThrough => src.truncate(),
+            Self::Replace => src.truncate(),
+            Self::Multiply => dst.truncate() * src.truncate(),
+            Self::Screen => {
+                let d = dst.truncate();
+                let s = src.truncate();
+                Vec3::ONE - (Vec3::ONE - d) * (Vec3::ONE - s)
+            }
+            Self::Overlay => {
+                let d = dst.truncate();
+                let s = src.truncate();
+                let mut out = Vec3::ZERO;
+                for i in 0..3 {
+                    let di = d[i];
+                    let si = s[i];
+                    out[i] = if di < 0.5 {
+                        2.0 * di * si
+                    } else {
+                        1.0 - 2.0 * (1.0 - di) * (1.0 - si)
+                    };
+                }
+                out
+            }
+            Self::Add => dst.truncate() + src.truncate(),
+            Self::Subtract => (dst.truncate() - src.truncate()).max(Vec3::ZERO),
+            Self::Darken => dst.truncate().min(src.truncate()),
+            Self::Lighten => dst.truncate().max(src.truncate()),
+        };
+
+        let final_rgb = dst.truncate() * (1.0 - eff_alpha) + blended_rgb * eff_alpha;
+        let final_a = (dst.w + eff_alpha * (1.0 - dst.w)).clamp(0.0, 1.0);
+        Vec4::new(final_rgb.x, final_rgb.y, final_rgb.z, final_a)
+    }
+
+    #[inline]
+    pub fn blend_scalar(&self, dst: f32, src: f32, opacity: f32) -> f32 {
+        let blended = match self {
+            Self::Normal | Self::PassThrough | Self::Replace => src,
+            Self::Multiply => dst * src,
+            Self::Screen => 1.0 - (1.0 - dst) * (1.0 - src),
+            Self::Overlay => {
+                if dst < 0.5 {
+                    2.0 * dst * src
+                } else {
+                    1.0 - 2.0 * (1.0 - dst) * (1.0 - src)
+                }
+            }
+            Self::Add => (dst + src).min(1.0),
+            Self::Subtract => (dst - src).max(0.0),
+            Self::Darken => dst.min(src),
+            Self::Lighten => dst.max(src),
+        };
+
+        dst * (1.0 - opacity) + blended * opacity
+    }
+}
+
+/// Per-channel blend modes matching Substance 3D Painter
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelBlendModes {
+    pub base_color: BlendMode,
+    pub roughness: BlendMode,
+    pub metallic: BlendMode,
+    pub normal: BlendMode,
+    pub height: BlendMode,
+    pub ao: BlendMode,
+    pub emission: BlendMode,
+    pub opacity: BlendMode,
+    pub clearcoat: BlendMode,
+    pub anisotropy: BlendMode,
+}
+
+impl Default for ChannelBlendModes {
+    fn default() -> Self {
+        Self {
+            base_color: BlendMode::Normal,
+            roughness: BlendMode::Normal,
+            metallic: BlendMode::Normal,
+            normal: BlendMode::Normal,
+            height: BlendMode::Add,
+            ao: BlendMode::Multiply,
+            emission: BlendMode::Normal,
+            opacity: BlendMode::Normal,
+            clearcoat: BlendMode::Normal,
+            anisotropy: BlendMode::Normal,
+        }
+    }
+}
+
+/// Per-channel opacities matching Substance 3D Painter
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelOpacities {
+    pub base_color: f32,
+    pub roughness: f32,
+    pub metallic: f32,
+    pub normal: f32,
+    pub height: f32,
+    pub ao: f32,
+    pub emission: f32,
+    pub opacity: f32,
+    pub clearcoat: f32,
+    pub anisotropy: f32,
+}
+
+impl Default for ChannelOpacities {
+    fn default() -> Self {
+        Self {
+            base_color: 1.0,
+            roughness: 1.0,
+            metallic: 1.0,
+            normal: 1.0,
+            height: 1.0,
+            ao: 1.0,
+            emission: 1.0,
+            opacity: 1.0,
+            clearcoat: 1.0,
+            anisotropy: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LayerType {
+    Paint,
+    Fill,
+    Folder,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProceduralGenerator {
+    None,
+    PerlinNoise,
+    WorleyGrunge,
+    BillowNoise,
+    RidgedMultifractal,
+    DomainWarpGrunge,
+    SplatterDirt,
+    WoodGrain,
+    FabricWeave,
+    Scratches,
+    CurvatureWear,
+    AmbientOcclusion,
+    DirectionalDust,
+    PositionGradient,
+    DrippingLeaks,
+    Checkerboard,
+    Bricks,
+    PerforatedMesh,
+    WireFence,
+    TornFabricEdge,
+    CircularDots,
+    PeelingPaint,
+    RustPits,
+    MetalEdgeHighlight,
+    GroundSplash,
+    BnWSpots1,
+    BnWSpots2,
+    BnWSpots3,
+    GrungeMap,
+    DirectionalNoise,
+    Clouds,
+    MarbleVeins,
+    MoistureNoise,
+}
+
+impl ProceduralGenerator {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::None => "Solid Uniform",
+            Self::PerlinNoise => "Perlin Noise (FBM)",
+            Self::WorleyGrunge => "Worley Grunge (Cellular)",
+            Self::BillowNoise => "Billow Noise (Clouds / Puffs)",
+            Self::RidgedMultifractal => "Ridged Multifractal (Cracks / Fissures)",
+            Self::DomainWarpGrunge => "Domain Warped Grunge (Fluid)",
+            Self::SplatterDirt => "Splatter & Rust Spots",
+            Self::WoodGrain => "Wood Grain & Fibers",
+            Self::FabricWeave => "Fabric & Carbon Weave",
+            Self::Scratches => "Micro Scratches",
+            Self::CurvatureWear => "Edge Wear (Curvature)",
+            Self::AmbientOcclusion => "Cavity Dirt (AO)",
+            Self::DirectionalDust => "Directional Dust (Normal & Pos)",
+            Self::PositionGradient => "Position Gradient (3D Height)",
+            Self::DrippingLeaks => "Dripping Leaks (Vertical Streaks)",
+            Self::Checkerboard => "Checkerboard",
+            Self::Bricks => "Bricks / Tiles",
+            Self::PerforatedMesh => "Perforated Mesh (Hex Holes)",
+            Self::WireFence => "Wire Fence (Diamond Mesh)",
+            Self::TornFabricEdge => "Torn Fabric (Ragged Cutout)",
+            Self::CircularDots => "Circular Dots / Holes",
+            Self::PeelingPaint => "Peeling Paint (Chipped Flakes)",
+            Self::RustPits => "Rust Pits & Oxidation Craters",
+            Self::MetalEdgeHighlight => "Metal Edge Highlight (Polished)",
+            Self::GroundSplash => "Ground Dirt & Mud Splash",
+            Self::BnWSpots1 => "BnW Spots 1 (Substance)",
+            Self::BnWSpots2 => "BnW Spots 2 (Substance)",
+            Self::BnWSpots3 => "BnW Spots 3 (Substance)",
+            Self::GrungeMap => "Grunge Map (Substance)",
+            Self::DirectionalNoise => "Directional Noise / Brushed",
+            Self::Clouds => "Fractal Clouds (Substance)",
+            Self::MarbleVeins => "Marble Veins / Strata",
+            Self::MoistureNoise => "Moisture / Condensation",
+        }
+    }
+
+    pub fn all() -> &'static [ProceduralGenerator] {
+        &[
+            Self::PerlinNoise,
+            Self::WorleyGrunge,
+            Self::BillowNoise,
+            Self::RidgedMultifractal,
+            Self::DomainWarpGrunge,
+            Self::SplatterDirt,
+            Self::WoodGrain,
+            Self::FabricWeave,
+            Self::Scratches,
+            Self::CurvatureWear,
+            Self::AmbientOcclusion,
+            Self::DirectionalDust,
+            Self::DrippingLeaks,
+            Self::PositionGradient,
+            Self::Checkerboard,
+            Self::Bricks,
+            Self::PerforatedMesh,
+            Self::WireFence,
+            Self::TornFabricEdge,
+            Self::CircularDots,
+            Self::PeelingPaint,
+            Self::RustPits,
+            Self::MetalEdgeHighlight,
+            Self::GroundSplash,
+            Self::BnWSpots1,
+            Self::BnWSpots2,
+            Self::BnWSpots3,
+            Self::GrungeMap,
+            Self::DirectionalNoise,
+            Self::Clouds,
+            Self::MarbleVeins,
+            Self::MoistureNoise,
+        ]
+    }
+}
+
+/// A non-destructive modifier/effect in a layer mask stack
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum MaskEffectType {
+    Fill {
+        generator: ProceduralGenerator,
+        scale: f32,
+        contrast: f32,
+        invert: bool,
+        balance: f32,
+    },
+    Paint {
+        buffer: ScalarBuffer,
+        #[serde(default)]
+        alpha: ScalarBuffer,
+    },
+    FilterLevels {
+        in_black: f32,
+        in_white: f32,
+        gamma: f32,
+        out_black: f32,
+        out_white: f32,
+    },
+    FilterBlur {
+        sigma: f32,
+    },
+    FilterInvert,
+    FilterSharpen {
+        strength: f32,
+    },
+    FilterHighPass {
+        radius: f32,
+    },
+    FilterContrast {
+        contrast: f32,
+        brightness: f32,
+    },
+    ColorSelection {
+        target_color: [f32; 3],
+        tolerance: f32,
+        softness: f32,
+    },
+    AnchorReference {
+        anchor_name: String,
+        source_channel: ChannelType,
+        blur: f32,
+        invert: bool,
+    },
+    GeneratorCurvatureWear {
+        wear_level: f32,
+        edge_width: f32,
+        edge_contrast: f32,
+        grunge_amount: f32,
+        grunge_scale: f32,
+        ao_inhibit: f32,
+        invert: bool,
+    },
+    GeneratorCavityDirt {
+        dirt_level: f32,
+        dirt_contrast: f32,
+        dirt_reach: f32,
+        grunge_clumping: f32,
+        grunge_scale: f32,
+        invert: bool,
+    },
+    GeneratorDirectionalDust {
+        dust_direction: [f32; 3],
+        dust_level: f32,
+        angle_tolerance: f32,
+        cavity_trap: f32,
+        grunge_breakup: f32,
+        grunge_scale: f32,
+    },
+    GeneratorGroundDirt {
+        bottom_level: f32,
+        gradient_softness: f32,
+        splash_amount: f32,
+        splash_scale: f32,
+    },
+    GeneratorMaskEditor {
+        curv_weight: f32,
+        curv_width: f32,
+        curv_contrast: f32,
+        curv_invert: bool,
+        ao_weight: f32,
+        ao_contrast: f32,
+        world_normal_weight: f32,
+        world_normal_dir: [f32; 3],
+        pos_weight: f32,
+        pos_height: f32,
+        grunge_weight: f32,
+        grunge_scale: f32,
+        global_balance: f32,
+        global_contrast: f32,
+        invert: bool,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MaskEffect {
+    pub id: u64,
+    pub name: String,
+    pub effect_type: MaskEffectType,
+    pub visible: bool,
+    pub opacity: f32,
+    pub blend_mode: BlendMode,
+}
+
+/// Reference to an anchor point source layer for cross-layer procedural referencing
+#[derive(Clone, Copy)]
+pub struct AnchorLayerRef<'a> {
+    pub name: &'a str,
+    pub has_mask: bool,
+    pub mask_buf: &'a ScalarBuffer,
+    pub base_color_buf: &'a RgbaBuffer,
+    pub roughness_buf: &'a ScalarBuffer,
+    pub metallic_buf: &'a ScalarBuffer,
+    pub height_buf: &'a ScalarBuffer,
+    pub opacity_buf: &'a ScalarBuffer,
+    pub emissive_buf: &'a RgbaBuffer,
+}
+
+/// A multi-channel creative layer (analogous to Substance Painter Layer)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Layer {
+    pub id: u64,
+    pub name: String,
+    pub layer_type: LayerType,
+    pub visible: bool,
+    pub opacity: f32,
+    pub blend_mode: BlendMode,
+    pub channel_flags: ChannelFlags,
+
+    // Fill layer material properties (PBR maps)
+    pub fill_color: Vec4,
+    pub fill_roughness: f32,
+    pub fill_metallic: f32,
+    pub fill_height: f32,
+    pub fill_normal_strength: f32,
+    pub fill_emissive: Vec4,
+    pub fill_opacity: f32,
+    pub fill_clearcoat: f32,
+    pub fill_anisotropy: f32,
+    pub fill_anisotropy_angle: f32,
+    pub fill_generator: ProceduralGenerator,
+    pub generator_scale: f32,
+    pub generator_contrast: f32,
+    pub generator_invert: bool,
+    pub triplanar: bool,
+
+    // UV Transformation parameters
+    pub uv_scale: f32,
+    pub uv_offset: glam::Vec2,
+    pub uv_rotation: f32,
+
+    // Texture Maps (if loaded) override uniform values
+    #[serde(skip)]
+    pub fill_color_tex: Option<RgbaBuffer>,
+    #[serde(skip)]
+    pub fill_roughness_tex: Option<ScalarBuffer>,
+    #[serde(skip)]
+    pub fill_metallic_tex: Option<ScalarBuffer>,
+    #[serde(skip)]
+    pub fill_normal_tex: Option<RgbaBuffer>,
+    #[serde(skip)]
+    pub fill_height_tex: Option<ScalarBuffer>,
+    #[serde(skip)]
+    pub fill_emissive_tex: Option<RgbaBuffer>,
+    #[serde(skip)]
+    pub fill_opacity_tex: Option<ScalarBuffer>,
+
+    // Raster buffers for paint layers
+    pub base_color_buf: RgbaBuffer,
+    pub roughness_buf: ScalarBuffer,
+    pub metallic_buf: ScalarBuffer,
+    pub height_buf: ScalarBuffer,
+    pub normal_buf: RgbaBuffer,
+    pub emissive_buf: RgbaBuffer,
+    pub opacity_buf: ScalarBuffer,
+    pub clearcoat_buf: ScalarBuffer,
+    pub anisotropy_buf: ScalarBuffer,
+    pub anisotropy_angle_buf: ScalarBuffer,
+
+    // Optional layer mask & Non-destructive mask effect stack
+    pub has_mask: bool,
+    pub mask_buf: ScalarBuffer,
+    pub mask_inverted: bool,
+    #[serde(default = "default_base_mask_val")]
+    pub base_mask_value: f32,
+    pub mask_effects: Vec<MaskEffect>,
+    pub next_mask_effect_id: u64,
+    #[serde(default)]
+    pub active_mask_effect_id: Option<u64>,
+    #[serde(skip)]
+    pub dirty_rect: Option<(u32, u32, u32, u32)>,
+    #[serde(skip)]
+    pub dirty_flags: LayerDirtyFlags,
+
+    // Folder / Group hierarchy
+    pub parent_folder_id: Option<u64>,
+    pub folder_collapsed: bool,
+
+    // Per-channel blend modes and opacities (Substance 3D Painter)
+    #[serde(default)]
+    pub channel_blend_modes: ChannelBlendModes,
+    #[serde(default)]
+    pub channel_opacities: ChannelOpacities,
+
+    // Anchor point identifier for cross-layer referencing
+    #[serde(default)]
+    pub anchor_point: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerDirtyFlags {
+    pub color: bool,
+    pub roughness: bool,
+    pub metallic: bool,
+    pub normal: bool,
+    pub mask: bool,
+}
+
+impl Default for LayerDirtyFlags {
+    fn default() -> Self {
+        Self {
+            color: true,
+            roughness: true,
+            metallic: true,
+            normal: true,
+            mask: true,
+        }
+    }
+}
+
+impl LayerDirtyFlags {
+    pub fn all() -> Self {
+        Self {
+            color: true,
+            roughness: true,
+            metallic: true,
+            normal: true,
+            mask: true,
+        }
+    }
+
+    pub fn none() -> Self {
+        Self {
+            color: false,
+            roughness: false,
+            metallic: false,
+            normal: false,
+            mask: false,
+        }
+    }
+
+    pub fn is_any(&self) -> bool {
+        self.color || self.roughness || self.metallic || self.normal || self.mask
+    }
+}
+
+fn default_base_mask_val() -> f32 {
+    1.0
+}
+
+impl Layer {
+    pub fn new_paint_layer(id: u64, name: String, width: u32, height: u32) -> Self {
+        Self {
+            id,
+            name,
+            layer_type: LayerType::Paint,
+            visible: true,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+            channel_flags: ChannelFlags::default(),
+
+            fill_color: Vec4::new(0.8, 0.8, 0.8, 1.0),
+            fill_roughness: 0.5,
+            fill_metallic: 0.0,
+            fill_height: 0.5,
+            fill_normal_strength: 1.0,
+            fill_emissive: Vec4::new(0.0, 0.0, 0.0, 1.0),
+            fill_opacity: 1.0,
+            fill_clearcoat: 0.0,
+            fill_anisotropy: 0.0,
+            fill_anisotropy_angle: 0.0,
+            fill_generator: ProceduralGenerator::None,
+            generator_scale: 8.0,
+            generator_contrast: 1.0,
+            generator_invert: false,
+            triplanar: false,
+
+            uv_scale: 1.0,
+            uv_offset: glam::Vec2::ZERO,
+            uv_rotation: 0.0,
+            fill_color_tex: None,
+            fill_roughness_tex: None,
+            fill_metallic_tex: None,
+            fill_normal_tex: None,
+            fill_height_tex: None,
+            fill_emissive_tex: None,
+            fill_opacity_tex: None,
+
+            // Transparent paint buffers
+            base_color_buf: RgbaBuffer::new(width, height, Vec4::ZERO),
+            roughness_buf: ScalarBuffer::new(width, height, 0.5),
+            metallic_buf: ScalarBuffer::new(width, height, 0.0),
+            height_buf: ScalarBuffer::new(width, height, 0.5),
+            normal_buf: RgbaBuffer::new(width, height, Vec4::new(0.5, 0.5, 1.0, 0.5)),
+            emissive_buf: RgbaBuffer::new(width, height, Vec4::ZERO),
+            opacity_buf: ScalarBuffer::new(width, height, 1.0),
+            clearcoat_buf: ScalarBuffer::new(width, height, 0.0),
+            anisotropy_buf: ScalarBuffer::new(width, height, 0.0),
+            anisotropy_angle_buf: ScalarBuffer::new(width, height, 0.0),
+
+            has_mask: false,
+            mask_buf: ScalarBuffer::new(width, height, 1.0),
+            mask_inverted: false,
+            base_mask_value: 1.0,
+            mask_effects: Vec::new(),
+            next_mask_effect_id: 0,
+            active_mask_effect_id: None,
+            dirty_rect: None,
+            dirty_flags: LayerDirtyFlags::all(),
+
+            parent_folder_id: None,
+            folder_collapsed: false,
+            channel_blend_modes: ChannelBlendModes::default(),
+            channel_opacities: ChannelOpacities::default(),
+            anchor_point: None,
+        }
+    }
+
+    pub fn new_folder_layer(id: u64, name: String, _width: u32, _height: u32) -> Self {
+        Self {
+            id,
+            name,
+            layer_type: LayerType::Folder,
+            visible: true,
+            opacity: 1.0,
+            blend_mode: BlendMode::PassThrough,
+            channel_flags: ChannelFlags::default(),
+            fill_color: Vec4::new(0.8, 0.8, 0.8, 1.0),
+            fill_roughness: 0.5,
+            fill_metallic: 0.0,
+            fill_height: 0.5,
+            fill_normal_strength: 1.0,
+            fill_emissive: Vec4::new(0.0, 0.0, 0.0, 1.0),
+            fill_opacity: 1.0,
+            fill_clearcoat: 0.0,
+            fill_anisotropy: 0.0,
+            fill_anisotropy_angle: 0.0,
+            fill_generator: ProceduralGenerator::None,
+            generator_scale: 8.0,
+            generator_contrast: 1.0,
+            generator_invert: false,
+            triplanar: false,
+            uv_scale: 1.0,
+            uv_offset: glam::Vec2::ZERO,
+            uv_rotation: 0.0,
+            fill_color_tex: None,
+            fill_roughness_tex: None,
+            fill_metallic_tex: None,
+            fill_normal_tex: None,
+            fill_height_tex: None,
+            fill_emissive_tex: None,
+            fill_opacity_tex: None,
+            // Folders never hold raster paint buffers: zero memory allocated
+            base_color_buf: RgbaBuffer::new(0, 0, Vec4::ZERO),
+            roughness_buf: ScalarBuffer::new(0, 0, 0.0),
+            metallic_buf: ScalarBuffer::new(0, 0, 0.0),
+            height_buf: ScalarBuffer::new(0, 0, 0.0),
+            normal_buf: RgbaBuffer::new(0, 0, Vec4::ZERO),
+            emissive_buf: RgbaBuffer::new(0, 0, Vec4::ZERO),
+            opacity_buf: ScalarBuffer::new(0, 0, 0.0),
+            clearcoat_buf: ScalarBuffer::new(0, 0, 0.0),
+            anisotropy_buf: ScalarBuffer::new(0, 0, 0.0),
+            anisotropy_angle_buf: ScalarBuffer::new(0, 0, 0.0),
+            has_mask: false,
+            mask_buf: ScalarBuffer::new(0, 0, 0.0),
+            mask_inverted: false,
+            base_mask_value: 1.0,
+            mask_effects: Vec::new(),
+            next_mask_effect_id: 0,
+            active_mask_effect_id: None,
+            dirty_rect: None,
+            dirty_flags: LayerDirtyFlags::none(),
+            parent_folder_id: None,
+            folder_collapsed: false,
+            channel_blend_modes: ChannelBlendModes {
+                base_color: BlendMode::PassThrough,
+                roughness: BlendMode::PassThrough,
+                metallic: BlendMode::PassThrough,
+                normal: BlendMode::PassThrough,
+                height: BlendMode::PassThrough,
+                ao: BlendMode::PassThrough,
+                emission: BlendMode::PassThrough,
+                opacity: BlendMode::PassThrough,
+                clearcoat: BlendMode::PassThrough,
+                anisotropy: BlendMode::PassThrough,
+            },
+            channel_opacities: ChannelOpacities::default(),
+            anchor_point: None,
+        }
+    }
+
+    pub fn new_fill_layer(
+        id: u64,
+        name: String,
+        width: u32,
+        height: u32,
+        color: Vec4,
+        roughness: f32,
+        metallic: f32,
+    ) -> Self {
+        let mut layer = Self::new_paint_layer(id, name, width, height);
+        layer.layer_type = LayerType::Fill;
+        layer.fill_color = color;
+        layer.fill_roughness = roughness;
+        layer.fill_metallic = metallic;
+        layer.fill_height = 0.5;
+        layer.fill_normal_strength = 1.0;
+        layer.channel_flags = ChannelFlags {
+            base_color: true,
+            roughness: true,
+            metallic: true,
+            normal: true,
+            height: true,
+            ao: false,
+            emission: false,
+            opacity: false,
+            clearcoat: false,
+            anisotropy: false,
+        };
+        layer.evaluate_fill(None);
+        layer.mark_dirty_full();
+        layer
+    }
+
+    pub fn mark_dirty_full(&mut self) {
+        let w = self.base_color_buf.width;
+        let h = self.base_color_buf.height;
+        if w > 0 && h > 0 {
+            self.dirty_rect = Some((0, 0, w - 1, h - 1));
+            self.dirty_flags = LayerDirtyFlags::all();
+        }
+    }
+
+    pub fn mark_dirty_channel(&mut self, ch: ChannelType) {
+        let w = self.base_color_buf.width;
+        let h = self.base_color_buf.height;
+        if w > 0 && h > 0 {
+            self.dirty_rect = Some((0, 0, w - 1, h - 1));
+            match ch {
+                ChannelType::BaseColor => self.dirty_flags.color = true,
+                ChannelType::Roughness => self.dirty_flags.roughness = true,
+                ChannelType::Metallic => self.dirty_flags.metallic = true,
+                ChannelType::Normal => self.dirty_flags.normal = true,
+                _ => {}
+            }
+        }
+    }
+
+    pub fn mark_dirty_mask(&mut self) {
+        let w = self.mask_buf.width;
+        let h = self.mask_buf.height;
+        if w > 0 && h > 0 {
+            self.dirty_rect = Some((0, 0, w - 1, h - 1));
+            self.dirty_flags.mask = true;
+        }
+    }
+
+    pub fn set_fill_roughness(&mut self, val: f32) {
+        self.fill_roughness = val;
+        if self.fill_roughness_tex.is_none() && self.fill_generator == ProceduralGenerator::None && !self.triplanar {
+            self.roughness_buf.data.fill(val);
+            self.mark_dirty_channel(ChannelType::Roughness);
+        }
+    }
+
+    pub fn set_fill_metallic(&mut self, val: f32) {
+        self.fill_metallic = val;
+        if self.fill_metallic_tex.is_none() && self.fill_generator == ProceduralGenerator::None && !self.triplanar {
+            self.metallic_buf.data.fill(val);
+            self.mark_dirty_channel(ChannelType::Metallic);
+        }
+    }
+
+    pub fn set_fill_color(&mut self, val: Vec4) {
+        self.fill_color = val;
+        if self.fill_color_tex.is_none() && self.fill_generator == ProceduralGenerator::None && !self.triplanar {
+            self.base_color_buf.data.fill(val);
+            self.mark_dirty_channel(ChannelType::BaseColor);
+        }
+    }
+
+    pub fn set_fill_clearcoat(&mut self, val: f32) {
+        self.fill_clearcoat = val;
+        if self.fill_generator == ProceduralGenerator::None && !self.triplanar {
+            self.clearcoat_buf.data.fill(val);
+            self.mark_dirty_full();
+        }
+    }
+
+    pub fn set_fill_emissive(&mut self, val: Vec4) {
+        self.fill_emissive = val;
+        if self.fill_emissive_tex.is_none() && self.fill_generator == ProceduralGenerator::None && !self.triplanar {
+            self.emissive_buf.data.fill(val);
+            self.mark_dirty_full();
+        }
+    }
+
+    pub fn set_fill_opacity(&mut self, val: f32) {
+        self.fill_opacity = val;
+        if self.fill_opacity_tex.is_none() && self.fill_generator == ProceduralGenerator::None && !self.triplanar {
+            self.opacity_buf.data.fill(val);
+            self.mark_dirty_full();
+        }
+    }
+
+    /// Resize all internal channel buffers to a new resolution
+    pub fn resize(&mut self, new_width: u32, new_height: u32) {
+        if self.layer_type == LayerType::Folder {
+            return;
+        }
+        self.base_color_buf.resize_bilinear(new_width, new_height);
+        self.normal_buf.resize_bilinear(new_width, new_height);
+        self.roughness_buf.resize_bilinear(new_width, new_height);
+        self.metallic_buf.resize_bilinear(new_width, new_height);
+        self.height_buf.resize_bilinear(new_width, new_height);
+        self.emissive_buf.resize_bilinear(new_width, new_height);
+        self.opacity_buf.resize_bilinear(new_width, new_height);
+        self.clearcoat_buf.resize_bilinear(new_width, new_height);
+        self.anisotropy_buf.resize_bilinear(new_width, new_height);
+        self.anisotropy_angle_buf.resize_bilinear(new_width, new_height);
+        self.mask_buf.resize_bilinear(new_width, new_height);
+        self.mark_dirty_full();
+    }
+
+    /// Create a lightweight snapshot of this layer for undo/redo stroke tracking.
+    /// Excludes heavy static texture maps (fill_color_tex, fill_normal_tex, etc.)
+    /// to avoid copying tens/hundreds of megabytes of read-only textures on every stroke.
+    pub fn clone_stroke_snapshot(&self) -> Box<Layer> {
+        self.clone_stroke_snapshot_selective(None, None)
+    }
+
+    /// High-performance selective stroke snapshot that clones ONLY the buffers
+    /// actively modified by the stroke target and active channels, bypassing
+    /// untouched channel buffers (avoiding hundreds of MBs of buffer allocations).
+    pub fn clone_stroke_snapshot_selective(
+        &self,
+        target: Option<crate::brush::PaintTarget>,
+        channels: Option<ChannelFlags>,
+    ) -> Box<Layer> {
+        let is_mask_only = target == Some(crate::brush::PaintTarget::Mask);
+        let ch = channels.unwrap_or(self.channel_flags);
+
+        let (bc, norm, rough, metal, height, emis, opac, cc, aniso, aniso_ang, mask) = if is_mask_only {
+            (
+                RgbaBuffer::new(0, 0, Vec4::ZERO),
+                RgbaBuffer::new(0, 0, Vec4::ZERO),
+                ScalarBuffer::new(0, 0, 0.0),
+                ScalarBuffer::new(0, 0, 0.0),
+                ScalarBuffer::new(0, 0, 0.0),
+                RgbaBuffer::new(0, 0, Vec4::ZERO),
+                ScalarBuffer::new(0, 0, 0.0),
+                ScalarBuffer::new(0, 0, 0.0),
+                ScalarBuffer::new(0, 0, 0.0),
+                ScalarBuffer::new(0, 0, 0.0),
+                self.mask_buf.clone(),
+            )
+        } else if target == Some(crate::brush::PaintTarget::Material) {
+            let (bc_norm, rest) = rayon::join(
+                || rayon::join(
+                    || if ch.base_color { self.base_color_buf.clone() } else { RgbaBuffer::new(0, 0, Vec4::ZERO) },
+                    || if ch.normal || ch.height { self.normal_buf.clone() } else { RgbaBuffer::new(0, 0, Vec4::ZERO) },
+                ),
+                || rayon::join(
+                    || rayon::join(
+                        || if ch.roughness { self.roughness_buf.clone() } else { ScalarBuffer::new(0, 0, 0.0) },
+                        || if ch.metallic { self.metallic_buf.clone() } else { ScalarBuffer::new(0, 0, 0.0) },
+                    ),
+                    || rayon::join(
+                        || rayon::join(
+                            || if ch.height { self.height_buf.clone() } else { ScalarBuffer::new(0, 0, 0.0) },
+                            || if ch.emission { self.emissive_buf.clone() } else { RgbaBuffer::new(0, 0, Vec4::ZERO) },
+                        ),
+                        || rayon::join(
+                            || if ch.opacity { self.opacity_buf.clone() } else { ScalarBuffer::new(0, 0, 0.0) },
+                            || rayon::join(
+                                || if ch.clearcoat { self.clearcoat_buf.clone() } else { ScalarBuffer::new(0, 0, 0.0) },
+                                || rayon::join(
+                                    || if ch.anisotropy { self.anisotropy_buf.clone() } else { ScalarBuffer::new(0, 0, 0.0) },
+                                    || if ch.anisotropy { self.anisotropy_angle_buf.clone() } else { ScalarBuffer::new(0, 0, 0.0) },
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            );
+            let (bc, norm) = bc_norm;
+            let ((rough, metal), ((height, emis), (opac, (cc, (aniso, aniso_ang))))) = rest;
+            let mask = ScalarBuffer::new(0, 0, 0.0);
+            (bc, norm, rough, metal, height, emis, opac, cc, aniso, aniso_ang, mask)
+        } else {
+            (
+                self.base_color_buf.clone(),
+                self.normal_buf.clone(),
+                self.roughness_buf.clone(),
+                self.metallic_buf.clone(),
+                self.height_buf.clone(),
+                self.emissive_buf.clone(),
+                self.opacity_buf.clone(),
+                self.clearcoat_buf.clone(),
+                self.anisotropy_buf.clone(),
+                self.anisotropy_angle_buf.clone(),
+                self.mask_buf.clone(),
+            )
+        };
+
+        Box::new(Layer {
+            id: self.id,
+            name: self.name.clone(),
+            layer_type: self.layer_type,
+            visible: self.visible,
+            opacity: self.opacity,
+            blend_mode: self.blend_mode,
+            channel_flags: self.channel_flags,
+
+            fill_color: self.fill_color,
+            fill_roughness: self.fill_roughness,
+            fill_metallic: self.fill_metallic,
+            fill_height: self.fill_height,
+            fill_normal_strength: self.fill_normal_strength,
+            fill_emissive: self.fill_emissive,
+            fill_opacity: self.fill_opacity,
+            fill_clearcoat: self.fill_clearcoat,
+            fill_anisotropy: self.fill_anisotropy,
+            fill_anisotropy_angle: self.fill_anisotropy_angle,
+            fill_generator: self.fill_generator,
+            generator_scale: self.generator_scale,
+            generator_contrast: self.generator_contrast,
+            generator_invert: self.generator_invert,
+            triplanar: self.triplanar,
+
+            uv_scale: self.uv_scale,
+            uv_offset: self.uv_offset,
+            uv_rotation: self.uv_rotation,
+
+            fill_color_tex: None,
+            fill_roughness_tex: None,
+            fill_metallic_tex: None,
+            fill_normal_tex: None,
+            fill_height_tex: None,
+            fill_emissive_tex: None,
+            fill_opacity_tex: None,
+
+            base_color_buf: bc,
+            roughness_buf: rough,
+            metallic_buf: metal,
+            height_buf: height,
+            normal_buf: norm,
+            emissive_buf: emis,
+            opacity_buf: opac,
+            clearcoat_buf: cc,
+            anisotropy_buf: aniso,
+            anisotropy_angle_buf: aniso_ang,
+
+            has_mask: self.has_mask,
+            mask_buf: mask,
+            mask_inverted: self.mask_inverted,
+            base_mask_value: self.base_mask_value,
+            mask_effects: self.mask_effects.clone(),
+            next_mask_effect_id: self.next_mask_effect_id,
+            active_mask_effect_id: self.active_mask_effect_id,
+            dirty_rect: self.dirty_rect,
+            dirty_flags: self.dirty_flags,
+            parent_folder_id: self.parent_folder_id,
+            folder_collapsed: self.folder_collapsed,
+            channel_blend_modes: self.channel_blend_modes,
+            channel_opacities: self.channel_opacities,
+            anchor_point: self.anchor_point.clone(),
+        })
+    }
+
+    /// Restore raster buffer state from a stroke snapshot, preserving loaded fill textures.
+    /// If selective buffer snapshot was used, empty buffers in snapshot will not overwrite
+    /// existing layer data.
+    pub fn restore_stroke_snapshot(&mut self, snapshot: &Layer) {
+        if !snapshot.base_color_buf.data.is_empty() {
+            self.base_color_buf = snapshot.base_color_buf.clone();
+        }
+        if !snapshot.roughness_buf.data.is_empty() {
+            self.roughness_buf = snapshot.roughness_buf.clone();
+        }
+        if !snapshot.metallic_buf.data.is_empty() {
+            self.metallic_buf = snapshot.metallic_buf.clone();
+        }
+        if !snapshot.height_buf.data.is_empty() {
+            self.height_buf = snapshot.height_buf.clone();
+        }
+        if !snapshot.normal_buf.data.is_empty() {
+            self.normal_buf = snapshot.normal_buf.clone();
+        }
+        if !snapshot.emissive_buf.data.is_empty() {
+            self.emissive_buf = snapshot.emissive_buf.clone();
+        }
+        if !snapshot.opacity_buf.data.is_empty() {
+            self.opacity_buf = snapshot.opacity_buf.clone();
+        }
+        if !snapshot.clearcoat_buf.data.is_empty() {
+            self.clearcoat_buf = snapshot.clearcoat_buf.clone();
+        }
+        if !snapshot.anisotropy_buf.data.is_empty() {
+            self.anisotropy_buf = snapshot.anisotropy_buf.clone();
+        }
+        if !snapshot.anisotropy_angle_buf.data.is_empty() {
+            self.anisotropy_angle_buf = snapshot.anisotropy_angle_buf.clone();
+        }
+        if !snapshot.mask_buf.data.is_empty() {
+            self.mask_buf = snapshot.mask_buf.clone();
+        }
+        self.has_mask = snapshot.has_mask;
+        self.mask_inverted = snapshot.mask_inverted;
+        self.base_mask_value = snapshot.base_mask_value;
+        self.mask_effects = snapshot.mask_effects.clone();
+        self.active_mask_effect_id = snapshot.active_mask_effect_id;
+        self.channel_flags = snapshot.channel_flags;
+        self.dirty_rect = snapshot.dirty_rect;
+        self.dirty_flags = snapshot.dirty_flags;
+    }
+
+    pub fn get_channel_blend_mode(&self, ch: ChannelType) -> BlendMode {
+        match ch {
+            ChannelType::BaseColor => self.channel_blend_modes.base_color,
+            ChannelType::Roughness => self.channel_blend_modes.roughness,
+            ChannelType::Metallic => self.channel_blend_modes.metallic,
+            ChannelType::Normal => self.channel_blend_modes.normal,
+            ChannelType::Height => self.channel_blend_modes.height,
+            ChannelType::AmbientOcclusion => self.channel_blend_modes.ao,
+            ChannelType::Emission => self.channel_blend_modes.emission,
+            ChannelType::Opacity => self.channel_blend_modes.opacity,
+            ChannelType::Clearcoat => self.channel_blend_modes.clearcoat,
+            ChannelType::Anisotropy => self.channel_blend_modes.anisotropy,
+        }
+    }
+
+    pub fn set_channel_blend_mode(&mut self, ch: ChannelType, mode: BlendMode) {
+        match ch {
+            ChannelType::BaseColor => self.channel_blend_modes.base_color = mode,
+            ChannelType::Roughness => self.channel_blend_modes.roughness = mode,
+            ChannelType::Metallic => self.channel_blend_modes.metallic = mode,
+            ChannelType::Normal => self.channel_blend_modes.normal = mode,
+            ChannelType::Height => self.channel_blend_modes.height = mode,
+            ChannelType::AmbientOcclusion => self.channel_blend_modes.ao = mode,
+            ChannelType::Emission => self.channel_blend_modes.emission = mode,
+            ChannelType::Opacity => self.channel_blend_modes.opacity = mode,
+            ChannelType::Clearcoat => self.channel_blend_modes.clearcoat = mode,
+            ChannelType::Anisotropy => self.channel_blend_modes.anisotropy = mode,
+        }
+        self.blend_mode = mode;
+    }
+
+    pub fn get_channel_opacity(&self, ch: ChannelType) -> f32 {
+        match ch {
+            ChannelType::BaseColor => self.channel_opacities.base_color,
+            ChannelType::Roughness => self.channel_opacities.roughness,
+            ChannelType::Metallic => self.channel_opacities.metallic,
+            ChannelType::Normal => self.channel_opacities.normal,
+            ChannelType::Height => self.channel_opacities.height,
+            ChannelType::AmbientOcclusion => self.channel_opacities.ao,
+            ChannelType::Emission => self.channel_opacities.emission,
+            ChannelType::Opacity => self.channel_opacities.opacity,
+            ChannelType::Clearcoat => self.channel_opacities.clearcoat,
+            ChannelType::Anisotropy => self.channel_opacities.anisotropy,
+        }
+    }
+
+    pub fn set_channel_opacity(&mut self, ch: ChannelType, op: f32) {
+        let op = op.clamp(0.0, 1.0);
+        match ch {
+            ChannelType::BaseColor => self.channel_opacities.base_color = op,
+            ChannelType::Roughness => self.channel_opacities.roughness = op,
+            ChannelType::Metallic => self.channel_opacities.metallic = op,
+            ChannelType::Normal => self.channel_opacities.normal = op,
+            ChannelType::Height => self.channel_opacities.height = op,
+            ChannelType::AmbientOcclusion => self.channel_opacities.ao = op,
+            ChannelType::Emission => self.channel_opacities.emission = op,
+            ChannelType::Opacity => self.channel_opacities.opacity = op,
+            ChannelType::Clearcoat => self.channel_opacities.clearcoat = op,
+            ChannelType::Anisotropy => self.channel_opacities.anisotropy = op,
+        }
+    }
+
+    pub fn add_black_mask(&mut self) {
+        self.has_mask = true;
+        self.mask_inverted = false;
+        self.base_mask_value = 0.0;
+        self.mask_buf.data.fill(0.0);
+        self.mask_effects.clear();
+        self.mark_dirty_full();
+    }
+
+    pub fn add_white_mask(&mut self) {
+        self.has_mask = true;
+        self.mask_inverted = false;
+        self.base_mask_value = 1.0;
+        self.mask_buf.data.fill(1.0);
+        self.mask_effects.clear();
+        self.mark_dirty_full();
+    }
+
+    pub fn add_curvature_mask(&mut self, curvature_map: Option<&ScalarBuffer>) {
+        self.has_mask = true;
+        self.mask_inverted = false;
+        let w = self.mask_buf.width;
+        let h = self.mask_buf.height;
+        
+        if let Some(curv) = curvature_map {
+            for y in 0..h {
+                for x in 0..w {
+                    let u = (x as f32 + 0.5) / w as f32;
+                    let v = (y as f32 + 0.5) / h as f32;
+                    
+                    // Sample curvature map using normalized UV coordinates for resolution independence
+                    let c = curv.sample_bilinear(glam::Vec2::new(u, v));
+                    
+                    // High-frequency grunge noise
+                    let (n1, n2) = NoiseGenerator::voronoi_2d(u * 24.0, v * 24.0);
+                    let fbm = NoiseGenerator::fbm_2d(u * 16.0, v * 16.0, 4, 2.0, 0.5);
+                    
+                    // Organic wear pattern
+                    let noise = ((n2 - n1) * 0.5 + fbm * 0.5).clamp(0.0, 1.0);
+                    
+                    // Curvature drives the wear, noise breaks it up
+                    // c > 0.5 is convex (edges)
+                    let edge_mask = if c > 0.51 { ((c - 0.51) * 4.0).clamp(0.0, 1.0) } else { 0.0 };
+                    
+                    // The wear only appears on edges, modulated by noise
+                    let final_wear = (edge_mask * noise * 2.5).clamp(0.0, 1.0);
+                    
+                    // Smoothstep for harsh chipped paint look
+                    let wear = final_wear * final_wear * (3.0 - 2.0 * final_wear); // smoothstep
+                    
+                    self.mask_buf.set_pixel(x, y, wear);
+                }
+            }
+        }
+        self.mark_dirty_full();
+    }
+
+    #[allow(dead_code)]
+    pub fn add_grunge_mask(&mut self) {
+        self.has_mask = true;
+        self.mask_inverted = false;
+        let w = self.mask_buf.width;
+        let h = self.mask_buf.height;
+        for y in 0..h {
+            for x in 0..w {
+                let u = x as f32 / w as f32;
+                let v = y as f32 / h as f32;
+                
+                let (d1, d2) = NoiseGenerator::voronoi_2d(u * 8.0, v * 8.0);
+                let scratches = (d2 - d1).clamp(0.0, 1.0);
+                let fbm = NoiseGenerator::fbm_2d(u * 12.0, v * 12.0, 5, 2.0, 0.5);
+                
+                // Mix scratches with dirt patches
+                let mask = (scratches * 0.4 + fbm * 0.8).clamp(0.0, 1.0);
+                let contrast = mask * mask * (3.0 - 2.0 * mask); // smoothstep
+                
+                self.mask_buf.set_pixel(x, y, contrast);
+            }
+        }
+        self.mark_dirty_full();
+    }
+    
+    #[allow(dead_code)]
+    pub fn add_ao_dirt_mask(&mut self, ao_map: Option<&ScalarBuffer>) {
+        self.has_mask = true;
+        self.mask_inverted = false;
+        let w = self.mask_buf.width;
+        let h = self.mask_buf.height;
+        
+        if let Some(ao) = ao_map {
+            for y in 0..h {
+                for x in 0..w {
+                    let u = (x as f32 + 0.5) / w as f32;
+                    let v = (y as f32 + 0.5) / h as f32;
+                    
+                    // Base AO sampled with normalized UV coordinates
+                    let a = ao.sample_bilinear(glam::Vec2::new(u, v));
+                    
+                    // Dirt goes in crevices (invert AO)
+                    let dirt_mask = 1.0 - a;
+                    
+                    let fbm = NoiseGenerator::fbm_2d(u * 20.0, v * 20.0, 3, 2.0, 0.5);
+                    
+                    // Dirt builds up strongly in crevices and fades out randomly
+                    let final_dirt = (dirt_mask * 1.5 * fbm).clamp(0.0, 1.0);
+                    
+                    self.mask_buf.set_pixel(x, y, final_dirt);
+                }
+            }
+        }
+        self.mark_dirty_full();
+    }
+
+    pub fn remove_mask(&mut self) {
+        self.has_mask = false;
+        self.mask_buf.data.fill(1.0);
+        self.mark_dirty_full();
+    }
+
+    pub fn invert_mask(&mut self) {
+        self.mask_inverted = !self.mask_inverted;
+        self.mark_dirty_full();
+    }
+
+    pub fn clear_mask(&mut self, value: f32) {
+        let v = value.clamp(0.0, 1.0);
+        self.has_mask = true;
+        self.base_mask_value = v;
+        self.mask_buf.data.fill(v);
+        self.mask_effects.clear();
+        self.mark_dirty_full();
+    }
+
+    /// Evaluates non-destructive procedural mask generator
+    pub fn generate_mask_procedural(
+        generator: ProceduralGenerator,
+        scale: f32,
+        contrast: f32,
+        invert: bool,
+        balance: f32,
+        width: u32,
+        height: u32,
+        curvature_map: Option<&ScalarBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+        position_map: Option<&RgbaBuffer>,
+        world_normal_map: Option<&RgbaBuffer>,
+    ) -> ScalarBuffer {
+        let mut buf = ScalarBuffer::new(width, height, 1.0);
+        let sc = scale.max(0.1);
+        for y in 0..height {
+            for x in 0..width {
+                let u = x as f32 / width as f32;
+                let v = y as f32 / height as f32;
+                let uv_mesh = glam::Vec2::new(u, v);
+                let raw_val = match generator {
+                    ProceduralGenerator::None => 1.0,
+                    ProceduralGenerator::PerlinNoise => {
+                        NoiseGenerator::fbm_perlin_2d(u * sc, v * sc, 4, 2.0, 0.5)
+                    }
+                    ProceduralGenerator::WorleyGrunge => {
+                        let (d1, d2) = NoiseGenerator::voronoi_2d(u * sc, v * sc);
+                        let noise = NoiseGenerator::fbm_2d(u * sc * 2.0, v * sc * 2.0, 3, 2.0, 0.5);
+                        ((d2 - d1) * (0.35 + 0.65 * noise)).clamp(0.0, 1.0)
+                    }
+                    ProceduralGenerator::BillowNoise => {
+                        NoiseGenerator::billow_2d(u * sc, v * sc, 4, 2.0, 0.5)
+                    }
+                    ProceduralGenerator::RidgedMultifractal => {
+                        NoiseGenerator::ridged_fbm_2d(u * sc, v * sc, 4, 2.0, 0.5)
+                    }
+                    ProceduralGenerator::DomainWarpGrunge => {
+                        NoiseGenerator::domain_warp_2d(u * sc * 0.5, v * sc * 0.5)
+                    }
+                    ProceduralGenerator::SplatterDirt => {
+                        NoiseGenerator::splatter_spots_2d(u * sc * 2.0, v * sc * 2.0)
+                    }
+                    ProceduralGenerator::WoodGrain => {
+                        NoiseGenerator::wood_grain_2d(u * sc, v * sc)
+                    }
+                    ProceduralGenerator::FabricWeave => {
+                        NoiseGenerator::fabric_weave_2d(u * sc, v * sc)
+                    }
+                    ProceduralGenerator::Scratches => {
+                        let raw = NoiseGenerator::scratches_2d(u * sc, v * sc);
+                        let fine = NoiseGenerator::fbm_2d(u * sc * 8.0, v * sc * 8.0, 2, 2.0, 0.5) * 0.15;
+                        (raw * 1.25 + fine * raw).clamp(0.0, 1.0)
+                    }
+                    ProceduralGenerator::CurvatureWear => {
+                        let noise = NoiseGenerator::fbm_perlin_2d(u * sc, v * sc, 4, 2.0, 0.5);
+                        let (w1, w2) = NoiseGenerator::voronoi_2d(u * sc * 2.5, v * sc * 2.5);
+                        let chip = (w2 - w1).clamp(0.0, 1.0);
+                        let ridge = NoiseGenerator::ridged_fbm_2d(u * sc * 3.5, v * sc * 3.5, 3, 2.0, 0.5);
+
+                        let raw_edge = if let Some(cm) = curvature_map {
+                            let curv = cm.sample_bilinear(uv_mesh);
+                            if curv > 0.505 {
+                                let t = (curv - 0.505) * 6.0;
+                                t.clamp(0.0, 1.0).powf(0.7)
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            let edge_synth = (ridge * 0.7 + chip * 0.3).powf(2.0);
+                            edge_synth * 0.85
+                        };
+
+                        let ao = ao_map.map(|am| am.sample_bilinear(uv_mesh)).unwrap_or(1.0);
+                        let ao_gate = (ao * 1.3 - 0.15).clamp(0.1, 1.0);
+
+                        let wear_core = (raw_edge * 1.8).clamp(0.0, 1.0);
+                        let wear_fringe = (raw_edge * 2.5 - 0.3).clamp(0.0, 1.0) * (0.35 * noise + 0.45 * chip + 0.20 * ridge);
+                        ((wear_core * 0.65 + wear_fringe * 1.3) * ao_gate).clamp(0.0, 1.0)
+                    }
+                    ProceduralGenerator::AmbientOcclusion => {
+                        let ao_val = ao_map.map(|am| am.sample_bilinear(uv_mesh)).unwrap_or(0.85);
+                        let curv_val = curvature_map.map(|cm| cm.sample_bilinear(uv_mesh)).unwrap_or(0.5);
+                        let grunge = NoiseGenerator::domain_warp_2d(u * sc * 1.2, v * sc * 1.2);
+                        let splatter = NoiseGenerator::splatter_spots_2d(u * sc * 2.5, v * sc * 2.5);
+                        let fine_fbm = NoiseGenerator::fbm_2d(u * sc * 4.0, v * sc * 4.0, 3, 2.0, 0.5);
+
+                        let crevice_ao = (1.0 - ao_val).clamp(0.0, 1.0).powf(0.8);
+                        let crevice_curv = if curv_val < 0.495 { ((0.495 - curv_val) * 4.5).clamp(0.0, 1.0).powf(0.7) } else { 0.0 };
+                        let crevice = (crevice_ao * 1.5 + crevice_curv * 1.2).clamp(0.0, 1.0);
+
+                        let sediment = 0.40 + 0.35 * grunge + 0.15 * splatter + 0.10 * fine_fbm;
+                        (crevice * sediment * 1.6).clamp(0.0, 1.0)
+                    }
+                    ProceduralGenerator::DirectionalDust => {
+                        let norm_y = world_normal_map
+                            .map(|nm| nm.sample_bilinear(uv_mesh).y * 2.0 - 1.0)
+                            .unwrap_or(0.85);
+                        let ao = ao_map.map(|am| am.sample_bilinear(uv_mesh)).unwrap_or(1.0);
+                        let billow = NoiseGenerator::billow_2d(u * sc * 1.5, v * sc * 1.5, 3, 2.0, 0.5);
+                        let fine_dust = NoiseGenerator::splatter_spots_2d(u * sc * 4.0, v * sc * 4.0);
+                        let perlin = NoiseGenerator::fbm_perlin_2d(u * sc * 2.0, v * sc * 2.0, 3, 2.0, 0.5);
+
+                        let facing_up = (norm_y - 0.1).max(0.0).powf(0.6).clamp(0.0, 1.0);
+                        let pocket_boost = 0.7 + (1.0 - ao) * 0.6;
+                        (facing_up * (0.35 + 0.40 * billow + 0.15 * fine_dust + 0.10 * perlin) * pocket_boost).clamp(0.0, 1.0)
+                    }
+                    ProceduralGenerator::PositionGradient => {
+                        let pos_y = position_map
+                            .map(|pm| pm.sample_bilinear(uv_mesh).y)
+                            .unwrap_or(v);
+                        pos_y.clamp(0.0, 1.0)
+                    }
+                    ProceduralGenerator::DrippingLeaks => {
+                        let drip = NoiseGenerator::dripping_leaks_2d(u * sc, v * sc);
+                        let ao = ao_map.map(|am| am.sample_bilinear(uv_mesh)).unwrap_or(0.8);
+                        let source_boost = 1.0 + (1.0 - ao) * 0.8;
+                        (drip * source_boost).clamp(0.0, 1.0)
+                    }
+                    ProceduralGenerator::PeelingPaint => {
+                        NoiseGenerator::peeling_paint_2d(u * sc, v * sc)
+                    }
+                    ProceduralGenerator::RustPits => {
+                        let pit = NoiseGenerator::rust_crater_2d(u * sc, v * sc);
+                        let ao = ao_map.map(|am| am.sample_bilinear(uv_mesh)).unwrap_or(0.85);
+                        let crevice_boost = 0.8 + (1.0 - ao) * 0.8;
+                        (pit * crevice_boost).clamp(0.0, 1.0)
+                    }
+                    ProceduralGenerator::MetalEdgeHighlight => {
+                        let curv = curvature_map.map(|cm| cm.sample_bilinear(uv_mesh)).unwrap_or(0.5);
+                        let fine_noise = NoiseGenerator::fbm_perlin_2d(u * sc * 3.0, v * sc * 3.0, 3, 2.0, 0.5);
+                        let edge = if curv > 0.515 {
+                            ((curv - 0.515) * 8.0).clamp(0.0, 1.0).powf(1.4)
+                        } else {
+                            0.0
+                        };
+                        (edge * (0.8 + 0.2 * fine_noise)).clamp(0.0, 1.0)
+                    }
+                    ProceduralGenerator::GroundSplash => {
+                        let pos_y = position_map.map(|pm| pm.sample_bilinear(uv_mesh).y).unwrap_or(v);
+                        let height_gradient = (1.0 - pos_y).clamp(0.0, 1.0).powf(1.8);
+                        let splatter = NoiseGenerator::splatter_spots_2d(u * sc * 2.0, v * sc * 2.0);
+                        let warp = NoiseGenerator::domain_warp_2d(u * sc * 0.8, v * sc * 0.8);
+                        let splash = height_gradient * (0.5 + 0.35 * splatter + 0.15 * warp);
+                        (splash * 1.5).clamp(0.0, 1.0)
+                    }
+                    ProceduralGenerator::Checkerboard => {
+                        let cx = (u * sc).floor() as i32;
+                        let cy = (v * sc).floor() as i32;
+                        if (cx + cy) % 2 == 0 { 1.0 } else { 0.0 }
+                    }
+                    ProceduralGenerator::Bricks => {
+                        let scaled_y = v * sc;
+                        let row = scaled_y.floor() as i32;
+                        let offset_x = if row % 2 != 0 { 0.5 } else { 0.0 };
+                        let scaled_x = u * sc + offset_x;
+                        let fx = (scaled_x - scaled_x.floor()).abs();
+                        let fy = (scaled_y - scaled_y.floor()).abs();
+                        if fx < 0.07 || fy < 0.07 { 0.0 } else { 1.0 }
+                    }
+                    ProceduralGenerator::PerforatedMesh => {
+                        let scaled_y = v * sc * 1.73205;
+                        let row = scaled_y.floor() as i32;
+                        let offset_x = if row % 2 != 0 { 0.5 } else { 0.0 };
+                        let scaled_x = u * sc + offset_x;
+                        let fx = (scaled_x - scaled_x.floor()) - 0.5;
+                        let fy = (scaled_y - scaled_y.floor()) - 0.5;
+                        let dist = (fx * fx + fy * fy).sqrt();
+                        if dist < 0.36 { 0.0 } else { 1.0 }
+                    }
+                    ProceduralGenerator::WireFence => {
+                        let rot_u = (u + v) * 0.7071 * sc;
+                        let rot_v = (v - u) * 0.7071 * sc;
+                        let fx = (rot_u - rot_u.floor() - 0.5).abs();
+                        let fy = (rot_v - rot_v.floor() - 0.5).abs();
+                        let wire_thickness = 0.09;
+                        let wire = (wire_thickness - fx).max(wire_thickness - fy);
+                        if wire > 0.0 { 1.0 } else { 0.0 }
+                    }
+                    ProceduralGenerator::TornFabricEdge => {
+                        let fbm = NoiseGenerator::fbm_2d(u * sc * 3.0, v * sc * 3.0, 4, 2.0, 0.5);
+                        let fibers = NoiseGenerator::ridged_fbm_2d(u * sc * 12.0, v * sc * 12.0, 3, 2.0, 0.5);
+                        let v_center = (v - 0.5).abs() * 2.0;
+                        let tear = v_center + (fbm - 0.5) * 0.7 + (fibers - 0.5) * 0.25;
+                        if tear < 0.5 { 1.0 } else { 0.0 }
+                    }
+                    ProceduralGenerator::CircularDots => {
+                        let fx = (u * sc - (u * sc).floor()) - 0.5;
+                        let fy = (v * sc - (v * sc).floor()) - 0.5;
+                        let dist = (fx * fx + fy * fy).sqrt();
+                        if dist < 0.32 { 0.0 } else { 1.0 }
+                    }
+                    ProceduralGenerator::BnWSpots1 => {
+                        NoiseGenerator::bnw_spots_1_2d(u * sc, v * sc)
+                    }
+                    ProceduralGenerator::BnWSpots2 => {
+                        NoiseGenerator::bnw_spots_2_2d(u * sc, v * sc)
+                    }
+                    ProceduralGenerator::BnWSpots3 => {
+                        NoiseGenerator::bnw_spots_3_2d(u * sc, v * sc)
+                    }
+                    ProceduralGenerator::GrungeMap => {
+                        NoiseGenerator::grunge_map_2d(u * sc, v * sc)
+                    }
+                    ProceduralGenerator::DirectionalNoise => {
+                        NoiseGenerator::directional_noise_2d(u * sc, v * sc, 0.785)
+                    }
+                    ProceduralGenerator::Clouds => {
+                        NoiseGenerator::clouds_noise_2d(u * sc, v * sc)
+                    }
+                    ProceduralGenerator::MarbleVeins => {
+                        NoiseGenerator::marble_veins_2d(u * sc, v * sc)
+                    }
+                    ProceduralGenerator::MoistureNoise => {
+                        NoiseGenerator::moisture_noise_2d(u * sc, v * sc)
+                    }
+                };
+                let with_balance = (raw_val + (balance - 0.5) * 1.5).clamp(0.0, 1.0);
+                let contrasted = ((with_balance - 0.5) * contrast + 0.5).clamp(0.0, 1.0);
+                let final_val = if invert { 1.0 - contrasted } else { contrasted };
+                buf.set_pixel(x, y, final_val);
+            }
+        }
+        buf
+    }
+
+    /// High-performance Rayon parallelized Curvature Edge Wear Generator
+    pub fn generate_mask_curvature_wear(
+        wear_level: f32,
+        edge_width: f32,
+        edge_contrast: f32,
+        grunge_amount: f32,
+        grunge_scale: f32,
+        ao_inhibit: f32,
+        invert: bool,
+        width: u32,
+        height: u32,
+        curvature_map: Option<&ScalarBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+    ) -> ScalarBuffer {
+        let mut buf = ScalarBuffer::new(width, height, 0.0);
+        let g_sc = grunge_scale.max(0.5);
+        let width_factor = edge_width.max(0.1);
+        let wear = wear_level.clamp(0.0, 1.0);
+        let threshold = 1.0 - wear * 0.95;
+
+        buf.data.par_chunks_mut(width as usize).enumerate().for_each(|(y, row)| {
+            let v = y as f32 / height as f32;
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let u = x as f32 / width as f32;
+                let uv = glam::Vec2::new(u, v);
+
+                let mut curv = if let Some(cm) = curvature_map {
+                    cm.sample_bilinear(uv)
+                } else {
+                    let r = NoiseGenerator::ridged_fbm_2d(u * 6.0, v * 6.0, 3, 2.0, 0.5);
+                    0.5 + (r - 0.5) * 0.4
+                };
+
+                if invert {
+                    curv = 1.0 - curv;
+                }
+
+                // Curvature distance above flat baseline (0.5)
+                let delta = (curv - 0.5).max(0.0) * 2.0;
+                let expanded = ((delta * width_factor - (threshold - 0.5)) / (1.05 - threshold)).clamp(0.0, 1.0);
+                let edge = ((expanded - 0.5) * edge_contrast + 0.5).clamp(0.0, 1.0);
+
+                // Flake & chipped perimeter noise
+                let (w1, w2) = NoiseGenerator::voronoi_2d(u * g_sc, v * g_sc);
+                let chip = (w2 - w1).clamp(0.0, 1.0);
+                let ridge = NoiseGenerator::ridged_fbm_2d(u * g_sc * 1.5, v * g_sc * 1.5, 3, 2.0, 0.5);
+                let perlin = NoiseGenerator::fbm_perlin_2d(u * g_sc * 0.5, v * g_sc * 0.5, 3, 2.0, 0.5);
+                let grunge = 0.45 * chip + 0.35 * ridge + 0.20 * perlin;
+
+                // Modulate edge with grunge chipping
+                let mut wear_val = edge * (1.0 - grunge_amount * (1.0 - grunge));
+
+                // AO cavity inhibit (suppress wear in protected crevices)
+                if ao_inhibit > 0.001 {
+                    if let Some(am) = ao_map {
+                        let ao = am.sample_bilinear(uv);
+                        let ao_gate = ((ao - 0.25) / 0.75).clamp(1.0 - ao_inhibit, 1.0);
+                        wear_val *= ao_gate;
+                    }
+                }
+
+                *pixel = wear_val.clamp(0.0, 1.0);
+            }
+        });
+
+        buf
+    }
+
+    /// High-performance Rayon parallelized Cavity Dirt & Crevice Grime (AO) Generator
+    pub fn generate_mask_cavity_dirt(
+        dirt_level: f32,
+        dirt_contrast: f32,
+        dirt_reach: f32,
+        grunge_clumping: f32,
+        grunge_scale: f32,
+        invert: bool,
+        width: u32,
+        height: u32,
+        ao_map: Option<&ScalarBuffer>,
+        curvature_map: Option<&ScalarBuffer>,
+    ) -> ScalarBuffer {
+        let mut buf = ScalarBuffer::new(width, height, 0.0);
+        let g_sc = grunge_scale.max(0.5);
+        let reach_exp = 1.0 / dirt_reach.max(0.1);
+        let level = dirt_level.clamp(0.0, 1.0) * 1.8;
+
+        buf.data.par_chunks_mut(width as usize).enumerate().for_each(|(y, row)| {
+            let v = y as f32 / height as f32;
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let u = x as f32 / width as f32;
+                let uv = glam::Vec2::new(u, v);
+
+                let ao = ao_map.map(|am| am.sample_bilinear(uv)).unwrap_or(0.85);
+                let curv = curvature_map.map(|cm| cm.sample_bilinear(uv)).unwrap_or(0.5);
+
+                let ao_crevice = (1.0 - ao).clamp(0.0, 1.0);
+                let curv_crevice = ((0.5 - curv) * 2.0).clamp(0.0, 1.0);
+                let mut cavity = (ao_crevice * 1.35 + curv_crevice * 0.65).clamp(0.0, 1.0);
+
+                if invert {
+                    cavity = 1.0 - cavity;
+                }
+
+                let expanded = cavity.powf(reach_exp);
+                let dirt_base = (expanded * level).clamp(0.0, 1.0);
+
+                let warp = NoiseGenerator::domain_warp_2d(u * g_sc * 0.6, v * g_sc * 0.6);
+                let splatter = NoiseGenerator::splatter_spots_2d(u * g_sc * 2.0, v * g_sc * 2.0);
+                let billow = NoiseGenerator::billow_2d(u * g_sc, v * g_sc, 3, 2.0, 0.5);
+                let grunge = 0.45 * warp + 0.30 * splatter + 0.25 * billow;
+
+                let grunged = dirt_base * (1.0 - grunge_clumping * (1.0 - grunge));
+                let contrasted = ((grunged - 0.5) * dirt_contrast + 0.5).clamp(0.0, 1.0);
+
+                *pixel = contrasted;
+            }
+        });
+
+        buf
+    }
+
+    /// High-performance Rayon parallelized Directional Dust & Weathering (Normal) Generator
+    pub fn generate_mask_directional_dust(
+        dust_direction: [f32; 3],
+        dust_level: f32,
+        angle_tolerance: f32,
+        cavity_trap: f32,
+        grunge_breakup: f32,
+        grunge_scale: f32,
+        width: u32,
+        height: u32,
+        world_normal_map: Option<&RgbaBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+    ) -> ScalarBuffer {
+        let mut buf = ScalarBuffer::new(width, height, 0.0);
+        let g_sc = grunge_scale.max(0.5);
+        let dir = glam::Vec3::new(dust_direction[0], dust_direction[1], dust_direction[2]).normalize_or_zero();
+        let tol = angle_tolerance.max(0.05);
+        let threshold = (1.0 - tol * 0.5).clamp(-1.0, 0.99);
+
+        buf.data.par_chunks_mut(width as usize).enumerate().for_each(|(y, row)| {
+            let v = y as f32 / height as f32;
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let u = x as f32 / width as f32;
+                let uv = glam::Vec2::new(u, v);
+
+                let norm = if let Some(wn) = world_normal_map {
+                    let col = wn.sample_bilinear(uv);
+                    glam::Vec3::new(col.x * 2.0 - 1.0, col.y * 2.0 - 1.0, col.z * 2.0 - 1.0).normalize_or_zero()
+                } else {
+                    glam::Vec3::new(0.0, 1.0, 0.0)
+                };
+
+                let dot_align = norm.dot(dir);
+                let angle_factor = ((dot_align - threshold) / (1.01 - threshold)).clamp(0.0, 1.0).powf(0.7);
+                let mut dust = (angle_factor * dust_level * 1.8).clamp(0.0, 1.0);
+
+                if cavity_trap > 0.001 {
+                    if let Some(am) = ao_map {
+                        let ao = am.sample_bilinear(uv);
+                        let trap = 1.0 + (1.0 - ao) * cavity_trap * 1.5;
+                        dust = (dust * trap).clamp(0.0, 1.0);
+                    }
+                }
+
+                let billow = NoiseGenerator::billow_2d(u * g_sc, v * g_sc, 3, 2.0, 0.5);
+                let splatter = NoiseGenerator::splatter_spots_2d(u * g_sc * 2.5, v * g_sc * 2.5);
+                let grunge = 0.65 * billow + 0.35 * splatter;
+
+                let final_dust = (dust * (1.0 - grunge_breakup * (1.0 - grunge))).clamp(0.0, 1.0);
+                *pixel = final_dust;
+            }
+        });
+
+        buf
+    }
+
+    /// High-performance Rayon parallelized Ground Dirt & Mud Splash (Position) Generator
+    pub fn generate_mask_ground_dirt(
+        bottom_level: f32,
+        gradient_softness: f32,
+        splash_amount: f32,
+        splash_scale: f32,
+        width: u32,
+        height: u32,
+        position_map: Option<&RgbaBuffer>,
+    ) -> ScalarBuffer {
+        let mut buf = ScalarBuffer::new(width, height, 0.0);
+        let g_sc = splash_scale.max(0.5);
+        let softness = gradient_softness.max(0.02);
+
+        buf.data.par_chunks_mut(width as usize).enumerate().for_each(|(y, row)| {
+            let v = y as f32 / height as f32;
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let u = x as f32 / width as f32;
+                let uv = glam::Vec2::new(u, v);
+
+                let height_val = if let Some(pm) = position_map {
+                    pm.sample_bilinear(uv).y.clamp(0.0, 1.0)
+                } else {
+                    1.0 - v
+                };
+
+                let base_grad = (1.0 - (height_val - (bottom_level - softness)) / softness).clamp(0.0, 1.0);
+
+                let splatter = NoiseGenerator::splatter_spots_2d(u * g_sc, v * g_sc);
+                let warp = NoiseGenerator::domain_warp_2d(u * g_sc * 0.4, v * g_sc * 0.4);
+                let splash_reach = (1.0 - (height_val - bottom_level).max(0.0) / 0.35).clamp(0.0, 1.0);
+                let splash = splatter * warp * splash_reach * splash_amount * 1.5;
+
+                *pixel = (base_grad + splash).clamp(0.0, 1.0);
+            }
+        });
+
+        buf
+    }
+
+    /// High-performance Rayon parallelized Substance-style Compound Mask Editor
+    pub fn generate_mask_mask_editor(
+        curv_weight: f32,
+        curv_width: f32,
+        curv_contrast: f32,
+        curv_invert: bool,
+        ao_weight: f32,
+        ao_contrast: f32,
+        world_normal_weight: f32,
+        world_normal_dir: [f32; 3],
+        pos_weight: f32,
+        pos_height: f32,
+        grunge_weight: f32,
+        grunge_scale: f32,
+        global_balance: f32,
+        global_contrast: f32,
+        invert: bool,
+        width: u32,
+        height: u32,
+        curvature_map: Option<&ScalarBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+        position_map: Option<&RgbaBuffer>,
+        world_normal_map: Option<&RgbaBuffer>,
+    ) -> ScalarBuffer {
+        let mut buf = ScalarBuffer::new(width, height, 0.0);
+        let g_sc = grunge_scale.max(0.5);
+        let dir = glam::Vec3::new(world_normal_dir[0], world_normal_dir[1], world_normal_dir[2]).normalize_or_zero();
+
+        buf.data.par_chunks_mut(width as usize).enumerate().for_each(|(y, row)| {
+            let v = y as f32 / height as f32;
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let u = x as f32 / width as f32;
+                let uv = glam::Vec2::new(u, v);
+
+                let mut comp = 0.0f32;
+                let mut total_w = 0.0f32;
+
+                // 1. Curvature
+                if curv_weight > 0.001 {
+                    let mut c = curvature_map.map(|cm| cm.sample_bilinear(uv)).unwrap_or(0.5);
+                    if curv_invert { c = 1.0 - c; }
+                    let delta = (c - 0.5).max(0.0) * 2.0;
+                    let expanded = (delta * curv_width).clamp(0.0, 1.0);
+                    let contrasted = ((expanded - 0.5) * curv_contrast + 0.5).clamp(0.0, 1.0);
+                    comp += contrasted * curv_weight;
+                    total_w += curv_weight;
+                }
+
+                // 2. Ambient Occlusion
+                if ao_weight > 0.001 {
+                    let ao = ao_map.map(|am| am.sample_bilinear(uv)).unwrap_or(0.85);
+                    let cavity = (1.0 - ao).clamp(0.0, 1.0);
+                    let contrasted = ((cavity - 0.5) * ao_contrast + 0.5).clamp(0.0, 1.0);
+                    comp += contrasted * ao_weight;
+                    total_w += ao_weight;
+                }
+
+                // 3. World Normal (Direction)
+                if world_normal_weight > 0.001 {
+                    let norm = if let Some(wn) = world_normal_map {
+                        let col = wn.sample_bilinear(uv);
+                        glam::Vec3::new(col.x * 2.0 - 1.0, col.y * 2.0 - 1.0, col.z * 2.0 - 1.0).normalize_or_zero()
+                    } else {
+                        glam::Vec3::new(0.0, 1.0, 0.0)
+                    };
+                    let align = (norm.dot(dir) * 0.5 + 0.5).clamp(0.0, 1.0);
+                    comp += align * world_normal_weight;
+                    total_w += world_normal_weight;
+                }
+
+                // 4. Position Height
+                if pos_weight > 0.001 {
+                    let h_val = position_map.map(|pm| pm.sample_bilinear(uv).y).unwrap_or(v);
+                    let pos_factor = (1.0 - (h_val - pos_height).abs() * 2.0).clamp(0.0, 1.0);
+                    comp += pos_factor * pos_weight;
+                    total_w += pos_weight;
+                }
+
+                let base_val = if total_w > 0.001 { comp / total_w } else { 0.5 };
+
+                // 5. Grunge Noise Modulation
+                let grunge = if grunge_weight > 0.001 {
+                    let (w1, w2) = NoiseGenerator::voronoi_2d(u * g_sc, v * g_sc);
+                    let fbm = NoiseGenerator::fbm_perlin_2d(u * g_sc * 1.5, v * g_sc * 1.5, 3, 2.0, 0.5);
+                    0.5 * (w2 - w1).clamp(0.0, 1.0) + 0.5 * fbm
+                } else {
+                    1.0
+                };
+
+                let grunged = base_val * (1.0 - grunge_weight * (1.0 - grunge));
+                let balanced = (grunged + (global_balance - 0.5) * 1.5).clamp(0.0, 1.0);
+                let final_val = ((balanced - 0.5) * global_contrast + 0.5).clamp(0.0, 1.0);
+
+                *pixel = if invert { 1.0 - final_val } else { final_val };
+            }
+        });
+
+        buf
+    }
+
+    /// Preserves existing hand-painted mask strokes by moving them into a base Paint effect
+    pub fn preserve_base_paint_if_needed(&mut self) {
+        if self.mask_effects.is_empty() && self.has_mask {
+            let has_paint = self.mask_buf.data.iter().any(|&v| (v - self.base_mask_value).abs() > 0.02);
+            if has_paint {
+                let w = self.mask_buf.width;
+                let h = self.mask_buf.height;
+                self.next_mask_effect_id += 1;
+                let id = self.next_mask_effect_id;
+                self.mask_effects.push(MaskEffect {
+                    id,
+                    name: "Base Paint".to_string(),
+                    effect_type: MaskEffectType::Paint {
+                        buffer: self.mask_buf.clone(),
+                        alpha: ScalarBuffer::new(w, h, 1.0),
+                    },
+                    visible: true,
+                    opacity: 1.0,
+                    blend_mode: BlendMode::Normal,
+                });
+            }
+        }
+    }
+
+    /// Evaluates the non-destructive mask effect stack from bottom to top
+    pub fn evaluate_mask(&mut self, curvature_map: Option<&ScalarBuffer>) {
+        self.evaluate_mask_full(curvature_map, None, None, None, None, &[]);
+    }
+
+    pub fn as_anchor_ref(&self) -> Option<AnchorLayerRef<'_>> {
+        self.anchor_point.as_ref().map(|name| AnchorLayerRef {
+            name: name.as_str(),
+            has_mask: self.has_mask,
+            mask_buf: &self.mask_buf,
+            base_color_buf: &self.base_color_buf,
+            roughness_buf: &self.roughness_buf,
+            metallic_buf: &self.metallic_buf,
+            height_buf: &self.height_buf,
+            opacity_buf: &self.opacity_buf,
+            emissive_buf: &self.emissive_buf,
+        })
+    }
+
+    /// Full multi-map evaluation of the mask effect stack
+    pub fn evaluate_mask_advanced(
+        &mut self,
+        curvature_map: Option<&ScalarBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+        position_map: Option<&RgbaBuffer>,
+        world_normal_map: Option<&RgbaBuffer>,
+    ) {
+        self.evaluate_mask_full(curvature_map, ao_map, position_map, world_normal_map, None, &[]);
+    }
+
+    /// Full multi-map, ID map, and cross-layer anchor point evaluation of mask stack
+    pub fn evaluate_mask_full(
+        &mut self,
+        curvature_map: Option<&ScalarBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+        position_map: Option<&RgbaBuffer>,
+        world_normal_map: Option<&RgbaBuffer>,
+        id_map: Option<&RgbaBuffer>,
+        anchor_refs: &[AnchorLayerRef<'_>],
+    ) {
+        if !self.has_mask {
+            return;
+        }
+
+        let w = self.mask_buf.width;
+        let h = self.mask_buf.height;
+        if w == 0 || h == 0 {
+            return;
+        }
+
+        if self.mask_effects.is_empty() {
+            self.mark_dirty_full();
+            return;
+        }
+
+        let mut accum = ScalarBuffer::new(w, h, self.base_mask_value);
+        let mut first = true;
+
+        for effect in &mut self.mask_effects {
+            if !effect.visible {
+                continue;
+            }
+
+            match &mut effect.effect_type {
+                MaskEffectType::Fill { generator, scale, contrast, invert, balance } => {
+                    let fill_buf = Self::generate_mask_procedural(
+                        *generator,
+                        *scale,
+                        *contrast,
+                        *invert,
+                        *balance,
+                        w,
+                        h,
+                        curvature_map,
+                        ao_map,
+                        position_map,
+                        world_normal_map,
+                    );
+                    if first && effect.blend_mode == BlendMode::Normal {
+                        accum = fill_buf;
+                        first = false;
+                    } else {
+                        first = false;
+                        for i in 0..(w * h) as usize {
+                            accum.data[i] = effect.blend_mode.blend_scalar(accum.data[i], fill_buf.data[i], effect.opacity);
+                        }
+                    }
+                }
+                MaskEffectType::Paint { buffer, alpha } => {
+                    first = false;
+                    if alpha.data.len() < (w * h) as usize {
+                        alpha.data.resize((w * h) as usize, 0.0);
+                    }
+                    for i in 0..(w * h) as usize {
+                        let a = (alpha.data[i] * effect.opacity).clamp(0.0, 1.0);
+                        if a > 0.001 {
+                            accum.data[i] = effect.blend_mode.blend_scalar(accum.data[i], buffer.data[i], a);
+                        }
+                    }
+                }
+                MaskEffectType::FilterLevels { in_black, in_white, gamma, out_black, out_white } => {
+                    accum.filter_levels(*in_black, *in_white, *gamma, *out_black, *out_white);
+                }
+                MaskEffectType::FilterBlur { sigma } => {
+                    accum.filter_gaussian_blur(*sigma);
+                }
+                MaskEffectType::FilterInvert => {
+                    accum.filter_invert();
+                }
+                MaskEffectType::FilterSharpen { strength } => {
+                    accum.filter_sharpen(*strength);
+                }
+                MaskEffectType::FilterHighPass { radius } => {
+                    accum.filter_high_pass(*radius);
+                }
+                MaskEffectType::FilterContrast { contrast, brightness } => {
+                    accum.filter_contrast_brightness(*contrast, *brightness);
+                }
+                MaskEffectType::ColorSelection { target_color, tolerance, softness } => {
+                    let mut sel_buf = ScalarBuffer::new(w, h, 0.0);
+                    if let Some(id_m) = id_map {
+                        let tol = *tolerance;
+                        let soft = (*softness).max(1e-4);
+                        let target = glam::Vec3::new(target_color[0], target_color[1], target_color[2]);
+                        for i in 0..(w * h) as usize {
+                            if i < id_m.data.len() {
+                                let col = id_m.data[i].truncate();
+                                let diff = (col - target).length();
+                                if diff <= tol {
+                                    sel_buf.data[i] = 1.0;
+                                } else if diff <= tol + soft {
+                                    sel_buf.data[i] = (1.0 - (diff - tol) / soft).clamp(0.0, 1.0);
+                                }
+                            }
+                        }
+                    }
+                    if first && effect.blend_mode == BlendMode::Normal {
+                        accum = sel_buf;
+                        first = false;
+                    } else {
+                        first = false;
+                        for i in 0..(w * h) as usize {
+                            accum.data[i] = effect.blend_mode.blend_scalar(accum.data[i], sel_buf.data[i], effect.opacity);
+                        }
+                    }
+                }
+                MaskEffectType::AnchorReference { anchor_name, source_channel, blur, invert } => {
+                    let mut ref_buf = ScalarBuffer::new(w, h, 0.0);
+                    if let Some(src) = anchor_refs.iter().find(|a| a.name == anchor_name.as_str()) {
+                        match source_channel {
+                            ChannelType::BaseColor => {
+                                for i in 0..(w * h) as usize {
+                                    if i < src.base_color_buf.data.len() {
+                                        let c = src.base_color_buf.data[i];
+                                        ref_buf.data[i] = (c.x * 0.299 + c.y * 0.587 + c.z * 0.114).clamp(0.0, 1.0);
+                                    }
+                                }
+                            }
+                            ChannelType::Roughness => {
+                                ref_buf = src.roughness_buf.clone();
+                            }
+                            ChannelType::Metallic => {
+                                ref_buf = src.metallic_buf.clone();
+                            }
+                            ChannelType::Height => {
+                                ref_buf = src.height_buf.clone();
+                            }
+                            ChannelType::Opacity => {
+                                ref_buf = src.opacity_buf.clone();
+                            }
+                            ChannelType::Emission => {
+                                for i in 0..(w * h) as usize {
+                                    if i < src.emissive_buf.data.len() {
+                                        let c = src.emissive_buf.data[i];
+                                        ref_buf.data[i] = (c.x * 0.299 + c.y * 0.587 + c.z * 0.114).clamp(0.0, 1.0);
+                                    }
+                                }
+                            }
+                            _ => {
+                                if src.has_mask {
+                                    ref_buf = src.mask_buf.clone();
+                                } else {
+                                    ref_buf = ScalarBuffer::new(w, h, 1.0);
+                                }
+                            }
+                        }
+                    }
+                    if *invert {
+                        ref_buf.filter_invert();
+                    }
+                    if *blur > 0.1 {
+                        ref_buf.filter_gaussian_blur(*blur);
+                    }
+                    if first && effect.blend_mode == BlendMode::Normal {
+                        accum = ref_buf;
+                        first = false;
+                    } else {
+                        first = false;
+                        for i in 0..(w * h) as usize {
+                            accum.data[i] = effect.blend_mode.blend_scalar(accum.data[i], ref_buf.data[i], effect.opacity);
+                        }
+                    }
+                }
+                MaskEffectType::GeneratorCurvatureWear {
+                    wear_level,
+                    edge_width,
+                    edge_contrast,
+                    grunge_amount,
+                    grunge_scale,
+                    ao_inhibit,
+                    invert,
+                } => {
+                    let gen_buf = Self::generate_mask_curvature_wear(
+                        *wear_level,
+                        *edge_width,
+                        *edge_contrast,
+                        *grunge_amount,
+                        *grunge_scale,
+                        *ao_inhibit,
+                        *invert,
+                        w,
+                        h,
+                        curvature_map,
+                        ao_map,
+                    );
+                    if first && effect.blend_mode == BlendMode::Normal {
+                        accum = gen_buf;
+                        first = false;
+                    } else {
+                        first = false;
+                        for i in 0..(w * h) as usize {
+                            accum.data[i] = effect.blend_mode.blend_scalar(accum.data[i], gen_buf.data[i], effect.opacity);
+                        }
+                    }
+                }
+                MaskEffectType::GeneratorCavityDirt {
+                    dirt_level,
+                    dirt_contrast,
+                    dirt_reach,
+                    grunge_clumping,
+                    grunge_scale,
+                    invert,
+                } => {
+                    let gen_buf = Self::generate_mask_cavity_dirt(
+                        *dirt_level,
+                        *dirt_contrast,
+                        *dirt_reach,
+                        *grunge_clumping,
+                        *grunge_scale,
+                        *invert,
+                        w,
+                        h,
+                        ao_map,
+                        curvature_map,
+                    );
+                    if first && effect.blend_mode == BlendMode::Normal {
+                        accum = gen_buf;
+                        first = false;
+                    } else {
+                        first = false;
+                        for i in 0..(w * h) as usize {
+                            accum.data[i] = effect.blend_mode.blend_scalar(accum.data[i], gen_buf.data[i], effect.opacity);
+                        }
+                    }
+                }
+                MaskEffectType::GeneratorDirectionalDust {
+                    dust_direction,
+                    dust_level,
+                    angle_tolerance,
+                    cavity_trap,
+                    grunge_breakup,
+                    grunge_scale,
+                } => {
+                    let gen_buf = Self::generate_mask_directional_dust(
+                        *dust_direction,
+                        *dust_level,
+                        *angle_tolerance,
+                        *cavity_trap,
+                        *grunge_breakup,
+                        *grunge_scale,
+                        w,
+                        h,
+                        world_normal_map,
+                        ao_map,
+                    );
+                    if first && effect.blend_mode == BlendMode::Normal {
+                        accum = gen_buf;
+                        first = false;
+                    } else {
+                        first = false;
+                        for i in 0..(w * h) as usize {
+                            accum.data[i] = effect.blend_mode.blend_scalar(accum.data[i], gen_buf.data[i], effect.opacity);
+                        }
+                    }
+                }
+                MaskEffectType::GeneratorGroundDirt {
+                    bottom_level,
+                    gradient_softness,
+                    splash_amount,
+                    splash_scale,
+                } => {
+                    let gen_buf = Self::generate_mask_ground_dirt(
+                        *bottom_level,
+                        *gradient_softness,
+                        *splash_amount,
+                        *splash_scale,
+                        w,
+                        h,
+                        position_map,
+                    );
+                    if first && effect.blend_mode == BlendMode::Normal {
+                        accum = gen_buf;
+                        first = false;
+                    } else {
+                        first = false;
+                        for i in 0..(w * h) as usize {
+                            accum.data[i] = effect.blend_mode.blend_scalar(accum.data[i], gen_buf.data[i], effect.opacity);
+                        }
+                    }
+                }
+                MaskEffectType::GeneratorMaskEditor {
+                    curv_weight,
+                    curv_width,
+                    curv_contrast,
+                    curv_invert,
+                    ao_weight,
+                    ao_contrast,
+                    world_normal_weight,
+                    world_normal_dir,
+                    pos_weight,
+                    pos_height,
+                    grunge_weight,
+                    grunge_scale,
+                    global_balance,
+                    global_contrast,
+                    invert,
+                } => {
+                    let gen_buf = Self::generate_mask_mask_editor(
+                        *curv_weight,
+                        *curv_width,
+                        *curv_contrast,
+                        *curv_invert,
+                        *ao_weight,
+                        *ao_contrast,
+                        *world_normal_weight,
+                        *world_normal_dir,
+                        *pos_weight,
+                        *pos_height,
+                        *grunge_weight,
+                        *grunge_scale,
+                        *global_balance,
+                        *global_contrast,
+                        *invert,
+                        w,
+                        h,
+                        curvature_map,
+                        ao_map,
+                        position_map,
+                        world_normal_map,
+                    );
+                    if first && effect.blend_mode == BlendMode::Normal {
+                        accum = gen_buf;
+                        first = false;
+                    } else {
+                        first = false;
+                        for i in 0..(w * h) as usize {
+                            accum.data[i] = effect.blend_mode.blend_scalar(accum.data[i], gen_buf.data[i], effect.opacity);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.mask_buf = accum;
+        self.mark_dirty_full();
+    }
+
+    pub fn add_mask_color_selection_effect(&mut self, target_color: [f32; 3], tolerance: f32, softness: f32) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        let blend_mode = if self.mask_effects.is_empty() { BlendMode::Normal } else { BlendMode::Add };
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Color Selection".to_string(),
+            effect_type: MaskEffectType::ColorSelection { target_color, tolerance, softness },
+            visible: true,
+            opacity: 1.0,
+            blend_mode,
+        });
+        self.active_mask_effect_id = Some(id);
+        id
+    }
+
+    pub fn add_mask_anchor_effect(&mut self, anchor_name: String, source_channel: ChannelType) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        let blend_mode = if self.mask_effects.is_empty() { BlendMode::Normal } else { BlendMode::Add };
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: format!("Anchor: {}", anchor_name),
+            effect_type: MaskEffectType::AnchorReference {
+                anchor_name,
+                source_channel,
+                blur: 0.0,
+                invert: false,
+            },
+            visible: true,
+            opacity: 1.0,
+            blend_mode,
+        });
+        self.active_mask_effect_id = Some(id);
+        id
+    }
+
+    pub fn add_mask_generator_curvature_wear(
+        &mut self,
+        curvature_map: Option<&ScalarBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+        position_map: Option<&RgbaBuffer>,
+        world_normal_map: Option<&RgbaBuffer>,
+    ) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        let blend_mode = if self.mask_effects.is_empty() { BlendMode::Normal } else { BlendMode::Add };
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Generator - Metal Edge Wear".to_string(),
+            effect_type: MaskEffectType::GeneratorCurvatureWear {
+                wear_level: 0.50,
+                edge_width: 1.0,
+                edge_contrast: 2.0,
+                grunge_amount: 0.65,
+                grunge_scale: 14.0,
+                ao_inhibit: 0.50,
+                invert: false,
+            },
+            visible: true,
+            opacity: 1.0,
+            blend_mode,
+        });
+        self.has_mask = true;
+        self.active_mask_effect_id = Some(id);
+        self.evaluate_mask_advanced(curvature_map, ao_map, position_map, world_normal_map);
+        id
+    }
+
+    pub fn add_mask_generator_cavity_dirt(
+        &mut self,
+        curvature_map: Option<&ScalarBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+        position_map: Option<&RgbaBuffer>,
+        world_normal_map: Option<&RgbaBuffer>,
+    ) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        let blend_mode = if self.mask_effects.is_empty() { BlendMode::Normal } else { BlendMode::Add };
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Generator - Cavity Dirt (AO)".to_string(),
+            effect_type: MaskEffectType::GeneratorCavityDirt {
+                dirt_level: 0.55,
+                dirt_contrast: 1.8,
+                dirt_reach: 1.2,
+                grunge_clumping: 0.60,
+                grunge_scale: 10.0,
+                invert: false,
+            },
+            visible: true,
+            opacity: 1.0,
+            blend_mode,
+        });
+        self.has_mask = true;
+        self.active_mask_effect_id = Some(id);
+        self.evaluate_mask_advanced(curvature_map, ao_map, position_map, world_normal_map);
+        id
+    }
+
+    pub fn add_mask_generator_directional_dust(
+        &mut self,
+        curvature_map: Option<&ScalarBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+        position_map: Option<&RgbaBuffer>,
+        world_normal_map: Option<&RgbaBuffer>,
+    ) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        let blend_mode = if self.mask_effects.is_empty() { BlendMode::Normal } else { BlendMode::Add };
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Generator - Directional Dust (+Y)".to_string(),
+            effect_type: MaskEffectType::GeneratorDirectionalDust {
+                dust_direction: [0.0, 1.0, 0.0],
+                dust_level: 0.50,
+                angle_tolerance: 1.0,
+                cavity_trap: 0.50,
+                grunge_breakup: 0.40,
+                grunge_scale: 8.0,
+            },
+            visible: true,
+            opacity: 1.0,
+            blend_mode,
+        });
+        self.has_mask = true;
+        self.active_mask_effect_id = Some(id);
+        self.evaluate_mask_advanced(curvature_map, ao_map, position_map, world_normal_map);
+        id
+    }
+
+    pub fn add_mask_generator_ground_dirt(
+        &mut self,
+        curvature_map: Option<&ScalarBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+        position_map: Option<&RgbaBuffer>,
+        world_normal_map: Option<&RgbaBuffer>,
+    ) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        let blend_mode = if self.mask_effects.is_empty() { BlendMode::Normal } else { BlendMode::Add };
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Generator - Ground Mud & Splash".to_string(),
+            effect_type: MaskEffectType::GeneratorGroundDirt {
+                bottom_level: 0.35,
+                gradient_softness: 0.25,
+                splash_amount: 0.50,
+                splash_scale: 16.0,
+            },
+            visible: true,
+            opacity: 1.0,
+            blend_mode,
+        });
+        self.has_mask = true;
+        self.active_mask_effect_id = Some(id);
+        self.evaluate_mask_advanced(curvature_map, ao_map, position_map, world_normal_map);
+        id
+    }
+
+    pub fn add_mask_generator_mask_editor(
+        &mut self,
+        curvature_map: Option<&ScalarBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+        position_map: Option<&RgbaBuffer>,
+        world_normal_map: Option<&RgbaBuffer>,
+    ) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        let blend_mode = if self.mask_effects.is_empty() { BlendMode::Normal } else { BlendMode::Add };
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Generator - Mask Editor".to_string(),
+            effect_type: MaskEffectType::GeneratorMaskEditor {
+                curv_weight: 0.70,
+                curv_width: 1.2,
+                curv_contrast: 2.0,
+                curv_invert: false,
+                ao_weight: 0.50,
+                ao_contrast: 1.5,
+                world_normal_weight: 0.30,
+                world_normal_dir: [0.0, 1.0, 0.0],
+                pos_weight: 0.0,
+                pos_height: 0.5,
+                grunge_weight: 0.50,
+                grunge_scale: 12.0,
+                global_balance: 0.50,
+                global_contrast: 1.0,
+                invert: false,
+            },
+            visible: true,
+            opacity: 1.0,
+            blend_mode,
+        });
+        self.has_mask = true;
+        self.active_mask_effect_id = Some(id);
+        self.evaluate_mask_advanced(curvature_map, ao_map, position_map, world_normal_map);
+        id
+    }
+
+    #[allow(dead_code)]
+    pub fn add_mask_fill_effect(&mut self, generator: ProceduralGenerator, curvature_map: Option<&ScalarBuffer>) -> u64 {
+        self.add_mask_fill_effect_advanced(generator, curvature_map, None, None, None)
+    }
+
+    pub fn add_mask_fill_effect_advanced(
+        &mut self,
+        generator: ProceduralGenerator,
+        curvature_map: Option<&ScalarBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+        position_map: Option<&RgbaBuffer>,
+        world_normal_map: Option<&RgbaBuffer>,
+    ) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        let name = format!("Fill - {}", generator.name());
+        let blend_mode = if self.mask_effects.is_empty() {
+            BlendMode::Normal
+        } else {
+            BlendMode::Add
+        };
+        self.mask_effects.push(MaskEffect {
+            id,
+            name,
+            effect_type: MaskEffectType::Fill {
+                generator,
+                scale: 8.0,
+                contrast: 1.0,
+                invert: false,
+                balance: 0.5,
+            },
+            visible: true,
+            opacity: 1.0,
+            blend_mode,
+        });
+        self.has_mask = true;
+        self.evaluate_mask_advanced(curvature_map, ao_map, position_map, world_normal_map);
+        id
+    }
+
+    pub fn add_mask_paint_effect(&mut self, curvature_map: Option<&ScalarBuffer>) -> u64 {
+        self.add_mask_paint_effect_advanced(curvature_map, None, None, None)
+    }
+
+    pub fn add_mask_paint_effect_advanced(
+        &mut self,
+        curvature_map: Option<&ScalarBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+        position_map: Option<&RgbaBuffer>,
+        world_normal_map: Option<&RgbaBuffer>,
+    ) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        let w = self.mask_buf.width;
+        let h = self.mask_buf.height;
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Paint Effect".to_string(),
+            effect_type: MaskEffectType::Paint {
+                buffer: ScalarBuffer::new(w, h, 1.0),
+                alpha: ScalarBuffer::new(w, h, 0.0),
+            },
+            visible: true,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+        });
+        self.has_mask = true;
+        self.active_mask_effect_id = Some(id);
+        self.evaluate_mask_advanced(curvature_map, ao_map, position_map, world_normal_map);
+        id
+    }
+
+    pub fn add_mask_filter_blur(&mut self, sigma: f32, curvature_map: Option<&ScalarBuffer>) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Blur Filter".to_string(),
+            effect_type: MaskEffectType::FilterBlur { sigma },
+            visible: true,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+        });
+        self.has_mask = true;
+        self.evaluate_mask(curvature_map);
+        id
+    }
+
+    pub fn add_mask_filter_levels(&mut self, curvature_map: Option<&ScalarBuffer>) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Levels Filter".to_string(),
+            effect_type: MaskEffectType::FilterLevels {
+                in_black: 0.0,
+                in_white: 1.0,
+                gamma: 1.0,
+                out_black: 0.0,
+                out_white: 1.0,
+            },
+            visible: true,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+        });
+        self.has_mask = true;
+        self.evaluate_mask(curvature_map);
+        id
+    }
+
+    pub fn add_mask_filter_invert(&mut self, curvature_map: Option<&ScalarBuffer>) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Invert Filter".to_string(),
+            effect_type: MaskEffectType::FilterInvert,
+            visible: true,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+        });
+        self.has_mask = true;
+        self.evaluate_mask(curvature_map);
+        id
+    }
+
+    pub fn add_mask_filter_sharpen(&mut self, strength: f32, curvature_map: Option<&ScalarBuffer>) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Sharpen Filter".to_string(),
+            effect_type: MaskEffectType::FilterSharpen { strength },
+            visible: true,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+        });
+        self.has_mask = true;
+        self.evaluate_mask(curvature_map);
+        id
+    }
+
+    pub fn add_mask_filter_high_pass(&mut self, radius: f32, curvature_map: Option<&ScalarBuffer>) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "High Pass Filter".to_string(),
+            effect_type: MaskEffectType::FilterHighPass { radius },
+            visible: true,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+        });
+        self.has_mask = true;
+        self.evaluate_mask(curvature_map);
+        id
+    }
+
+    pub fn add_mask_filter_contrast(&mut self, contrast: f32, brightness: f32, curvature_map: Option<&ScalarBuffer>) -> u64 {
+        self.preserve_base_paint_if_needed();
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Contrast Filter".to_string(),
+            effect_type: MaskEffectType::FilterContrast { contrast, brightness },
+            visible: true,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+        });
+        self.has_mask = true;
+        self.evaluate_mask(curvature_map);
+        id
+    }
+
+    pub fn remove_mask_effect(&mut self, id: u64, curvature_map: Option<&ScalarBuffer>) {
+        self.mask_effects.retain(|e| e.id != id);
+        if self.active_mask_effect_id == Some(id) {
+            self.active_mask_effect_id = None;
+        }
+        self.evaluate_mask(curvature_map);
+    }
+
+    pub fn reorder_mask_effect(&mut self, id: u64, move_up: bool, curvature_map: Option<&ScalarBuffer>) {
+        if let Some(pos) = self.mask_effects.iter().position(|e| e.id == id) {
+            if move_up && pos + 1 < self.mask_effects.len() {
+                self.mask_effects.swap(pos, pos + 1);
+            } else if !move_up && pos > 0 {
+                self.mask_effects.swap(pos, pos - 1);
+            }
+            self.evaluate_mask(curvature_map);
+        }
+    }
+
+    pub fn apply_filter_blur(&mut self, radius: f32, target_mask: bool) {
+        if target_mask {
+            if self.has_mask {
+                self.mask_buf.filter_gaussian_blur(radius);
+            }
+        } else {
+            if self.channel_flags.base_color { self.base_color_buf.filter_gaussian_blur(radius); }
+            if self.channel_flags.roughness { self.roughness_buf.filter_gaussian_blur(radius); }
+            if self.channel_flags.metallic { self.metallic_buf.filter_gaussian_blur(radius); }
+            if self.channel_flags.normal { self.normal_buf.filter_gaussian_blur(radius); }
+            if self.channel_flags.height { self.height_buf.filter_gaussian_blur(radius); }
+        }
+        self.mark_dirty_full();
+    }
+
+    pub fn apply_filter_levels(&mut self, in_b: f32, in_w: f32, gamma: f32, out_b: f32, out_w: f32, target_mask: bool) {
+        if target_mask {
+            if self.has_mask {
+                self.mask_buf.filter_levels(in_b, in_w, gamma, out_b, out_w);
+            }
+        } else {
+            if self.channel_flags.base_color { self.base_color_buf.filter_levels(in_b, in_w, gamma, out_b, out_w); }
+            if self.channel_flags.roughness { self.roughness_buf.filter_levels(in_b, in_w, gamma, out_b, out_w); }
+            if self.channel_flags.metallic { self.metallic_buf.filter_levels(in_b, in_w, gamma, out_b, out_w); }
+            if self.channel_flags.height { self.height_buf.filter_levels(in_b, in_w, gamma, out_b, out_w); }
+        }
+        self.mark_dirty_full();
+    }
+
+    pub fn apply_filter_invert(&mut self, target_mask: bool) {
+        if target_mask {
+            if self.has_mask {
+                self.mask_buf.filter_invert();
+            }
+        } else {
+            if self.channel_flags.base_color { self.base_color_buf.filter_invert(); }
+            if self.channel_flags.roughness { self.roughness_buf.filter_invert(); }
+            if self.channel_flags.metallic { self.metallic_buf.filter_invert(); }
+            if self.channel_flags.height { self.height_buf.filter_invert(); }
+        }
+        self.mark_dirty_full();
+    }
+
+    pub fn apply_filter_sharpen(&mut self, strength: f32, target_mask: bool) {
+        if target_mask {
+            if self.has_mask {
+                self.mask_buf.filter_sharpen(strength);
+            }
+        } else {
+            if self.channel_flags.base_color { self.base_color_buf.filter_sharpen(strength); }
+            if self.channel_flags.roughness { self.roughness_buf.filter_sharpen(strength); }
+            if self.channel_flags.metallic { self.metallic_buf.filter_sharpen(strength); }
+            if self.channel_flags.height { self.height_buf.filter_sharpen(strength); }
+        }
+        self.mark_dirty_full();
+    }
+
+    pub fn apply_filter_contrast_brightness(&mut self, contrast: f32, brightness: f32, target_mask: bool) {
+        if target_mask {
+            if self.has_mask {
+                self.mask_buf.filter_contrast_brightness(contrast, brightness);
+            }
+        } else {
+            if self.channel_flags.base_color { self.base_color_buf.filter_contrast_brightness(contrast, brightness); }
+            if self.channel_flags.roughness { self.roughness_buf.filter_contrast_brightness(contrast, brightness); }
+            if self.channel_flags.metallic { self.metallic_buf.filter_contrast_brightness(contrast, brightness); }
+            if self.channel_flags.height { self.height_buf.filter_contrast_brightness(contrast, brightness); }
+        }
+        self.mark_dirty_full();
+    }
+
+    pub fn apply_filter_high_pass(&mut self, radius: f32, target_mask: bool) {
+        if target_mask {
+            if self.has_mask {
+                self.mask_buf.filter_high_pass(radius);
+            }
+        } else {
+            if self.channel_flags.base_color { self.base_color_buf.filter_high_pass(radius); }
+            if self.channel_flags.roughness { self.roughness_buf.filter_high_pass(radius); }
+            if self.channel_flags.metallic { self.metallic_buf.filter_high_pass(radius); }
+            if self.channel_flags.height { self.height_buf.filter_high_pass(radius); }
+        }
+        self.mark_dirty_full();
+    }
+
+    /// Finds or creates an active Paint effect in the mask effect stack
+    pub fn get_or_create_active_mask_paint(&mut self) -> &mut MaskEffect {
+        if let Some(act_id) = self.active_mask_effect_id {
+            if let Some(pos) = self.mask_effects.iter().position(|e| e.id == act_id && matches!(e.effect_type, MaskEffectType::Paint { .. })) {
+                return &mut self.mask_effects[pos];
+            }
+        }
+        if let Some(pos) = self.mask_effects.iter().rposition(|e| matches!(e.effect_type, MaskEffectType::Paint { .. })) {
+            self.active_mask_effect_id = Some(self.mask_effects[pos].id);
+            return &mut self.mask_effects[pos];
+        }
+        let w = self.mask_buf.width;
+        let h = self.mask_buf.height;
+        self.next_mask_effect_id += 1;
+        let id = self.next_mask_effect_id;
+        self.mask_effects.push(MaskEffect {
+            id,
+            name: "Paint".to_string(),
+            effect_type: MaskEffectType::Paint {
+                buffer: ScalarBuffer::new(w, h, 1.0),
+                alpha: ScalarBuffer::new(w, h, 0.0),
+            },
+            visible: true,
+            opacity: 1.0,
+            blend_mode: BlendMode::Normal,
+        });
+        self.active_mask_effect_id = Some(id);
+        let last_idx = self.mask_effects.len() - 1;
+        &mut self.mask_effects[last_idx]
+    }
+
+    /// Regenerate procedural fill buffers (all PBR maps) with optional mesh maps
+    pub fn evaluate_fill(&mut self, curvature_map: Option<&ScalarBuffer>) {
+        self.evaluate_fill_advanced(curvature_map, None, None, None);
+    }
+
+    /// Full procedural fill evaluation with curvature, position (WPO), world normal, and AO support
+    pub fn evaluate_fill_advanced(
+        &mut self,
+        curvature_map: Option<&ScalarBuffer>,
+        position_map: Option<&RgbaBuffer>,
+        normal_map: Option<&RgbaBuffer>,
+        ao_map: Option<&ScalarBuffer>,
+    ) {
+        if self.layer_type != LayerType::Fill {
+            return;
+        }
+
+        // Fast path for solid color fill layers: bypass per-pixel noise math and Sobel filters
+        if self.fill_generator == ProceduralGenerator::None
+            && !self.triplanar
+            && self.fill_color_tex.is_none()
+            && self.fill_roughness_tex.is_none()
+            && self.fill_metallic_tex.is_none()
+            && self.fill_height_tex.is_none()
+            && self.fill_emissive_tex.is_none()
+            && self.fill_opacity_tex.is_none()
+            && self.fill_normal_tex.is_none()
+        {
+            self.base_color_buf.data.fill(self.fill_color);
+            self.roughness_buf.data.fill(self.fill_roughness);
+            self.metallic_buf.data.fill(self.fill_metallic);
+            self.height_buf.data.fill(self.fill_height);
+            self.emissive_buf.data.fill(self.fill_emissive);
+            self.opacity_buf.data.fill(self.fill_opacity);
+            self.clearcoat_buf.data.fill(self.fill_clearcoat);
+            self.anisotropy_buf.data.fill(self.fill_anisotropy);
+            self.anisotropy_angle_buf.data.fill(self.fill_anisotropy_angle);
+            self.normal_buf.data.fill(glam::Vec4::new(0.5, 0.5, 1.0, 1.0));
+            self.mark_dirty_full();
+            return;
+        }
+
+        self.clearcoat_buf.data.fill(self.fill_clearcoat);
+        self.anisotropy_buf.data.fill(self.fill_anisotropy);
+        self.anisotropy_angle_buf.data.fill(self.fill_anisotropy_angle);
+
+        let w = self.base_color_buf.width;
+        let h = self.base_color_buf.height;
+        let uv_scale = self.uv_scale.max(0.001);
+
+        let rad = self.uv_rotation.to_radians();
+        let (sin_r, cos_r) = rad.sin_cos();
+        let uv_offset = self.uv_offset;
+        let triplanar = self.triplanar;
+        let fill_generator = self.fill_generator;
+        let generator_scale = self.generator_scale;
+        let generator_contrast = self.generator_contrast;
+        let generator_invert = self.generator_invert;
+        let fill_color = self.fill_color;
+        let fill_roughness = self.fill_roughness;
+        let fill_metallic = self.fill_metallic;
+        let fill_height = self.fill_height;
+        let fill_emissive = self.fill_emissive;
+        let fill_opacity = self.fill_opacity;
+
+        let fill_color_tex = self.fill_color_tex.as_ref();
+        let fill_roughness_tex = self.fill_roughness_tex.as_ref();
+        let fill_metallic_tex = self.fill_metallic_tex.as_ref();
+        let fill_height_tex = self.fill_height_tex.as_ref();
+        let fill_emissive_tex = self.fill_emissive_tex.as_ref();
+        let fill_opacity_tex = self.fill_opacity_tex.as_ref();
+
+        self.base_color_buf.data
+            .par_chunks_exact_mut(w as usize)
+            .zip(self.roughness_buf.data.par_chunks_exact_mut(w as usize))
+            .zip(self.metallic_buf.data.par_chunks_exact_mut(w as usize))
+            .zip(self.height_buf.data.par_chunks_exact_mut(w as usize))
+            .zip(self.emissive_buf.data.par_chunks_exact_mut(w as usize))
+            .zip(self.opacity_buf.data.par_chunks_exact_mut(w as usize))
+            .enumerate()
+            .for_each(|(y, (((((base_row, rough_row), metal_row), height_row), emissive_row), opacity_row))| {
+                let y = y as u32;
+                for x in 0..w {
+                    // UV coordinates with scale, offset, and centered rotation
+                    let u_base = (x as f32 / w as f32) + uv_offset.x;
+                    let v_base = (y as f32 / h as f32) + uv_offset.y;
+
+                    let cu = u_base - 0.5;
+                    let cv = v_base - 0.5;
+                    let ru = (cu * cos_r - cv * sin_r + 0.5) * uv_scale;
+                    let rv = (cu * sin_r + cv * cos_r + 0.5) * uv_scale;
+                    let uv_mesh = glam::Vec2::new((x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32);
+
+                    let (noise_factor, bump_factor) = if triplanar && position_map.is_some() {
+                        let pos_sample = position_map.unwrap().sample_bilinear(uv_mesh);
+                        let norm_sample = normal_map.map(|nm| nm.sample_bilinear(uv_mesh)).unwrap_or(glam::Vec4::new(0.5, 0.5, 1.0, 1.0));
+                        let p3 = glam::Vec3::new(pos_sample.x, pos_sample.y, pos_sample.z) * generator_scale * 4.0;
+                        let n = (norm_sample.truncate() * 2.0 - glam::Vec3::ONE).normalize_or_zero();
+                        let mut weights = glam::Vec3::new(n.x.abs().powi(4), n.y.abs().powi(4), n.z.abs().powi(4));
+                        let sum = weights.x + weights.y + weights.z;
+                        if sum > 1e-4 { weights /= sum; } else { weights = glam::Vec3::new(0.33, 0.34, 0.33); }
+
+                        let nx = NoiseGenerator::fbm_2d(p3.y, p3.z, 4, 2.0, 0.5);
+                        let ny = NoiseGenerator::fbm_2d(p3.x, p3.z, 4, 2.0, 0.5);
+                        let nz = NoiseGenerator::fbm_2d(p3.x, p3.y, 4, 2.0, 0.5);
+                        let tri = weights.x * nx + weights.y * ny + weights.z * nz;
+                        (tri, tri)
+                    } else {
+                        match fill_generator {
+                            ProceduralGenerator::None => (1.0, 0.5),
+                            ProceduralGenerator::PerlinNoise => {
+                                let n = NoiseGenerator::fbm_perlin_2d(ru * generator_scale, rv * generator_scale, 4, 2.0, 0.5);
+                                (n, n)
+                            }
+                            ProceduralGenerator::WorleyGrunge => {
+                                let (d1, d2) = NoiseGenerator::voronoi_2d(ru * generator_scale, rv * generator_scale);
+                                let edge = (d2 - d1).clamp(0.0, 1.0);
+                                (edge, 1.0 - edge)
+                            }
+                            ProceduralGenerator::BillowNoise => {
+                                let n = NoiseGenerator::billow_2d(ru * generator_scale, rv * generator_scale, 4, 2.0, 0.5);
+                                (n, n)
+                            }
+                            ProceduralGenerator::RidgedMultifractal => {
+                                let n = NoiseGenerator::ridged_fbm_2d(ru * generator_scale, rv * generator_scale, 4, 2.0, 0.5);
+                                (n, n)
+                            }
+                            ProceduralGenerator::DomainWarpGrunge => {
+                                let n = NoiseGenerator::domain_warp_2d(ru * generator_scale * 0.5, rv * generator_scale * 0.5);
+                                (n, n)
+                            }
+                            ProceduralGenerator::SplatterDirt => {
+                                let n = NoiseGenerator::splatter_spots_2d(ru * generator_scale * 2.0, rv * generator_scale * 2.0);
+                                (n, n)
+                            }
+                            ProceduralGenerator::WoodGrain => {
+                                let n = NoiseGenerator::wood_grain_2d(ru * generator_scale, rv * generator_scale);
+                                (n, n)
+                            }
+                            ProceduralGenerator::FabricWeave => {
+                                let n = NoiseGenerator::fabric_weave_2d(ru * generator_scale, rv * generator_scale);
+                                (n, n)
+                            }
+                            ProceduralGenerator::Scratches => {
+                                let s = NoiseGenerator::scratches_2d(ru * generator_scale, rv * generator_scale);
+                                (1.0 - s * 0.75, 0.5 - s * 0.35)
+                            }
+                            ProceduralGenerator::CurvatureWear => {
+                                let noise = NoiseGenerator::fbm_perlin_2d(ru * generator_scale, rv * generator_scale, 4, 2.0, 0.5);
+                                let (w1, w2) = NoiseGenerator::voronoi_2d(ru * generator_scale * 2.5, rv * generator_scale * 2.5);
+                                let chip = (w2 - w1).clamp(0.0, 1.0);
+                                let ridge = NoiseGenerator::ridged_fbm_2d(ru * generator_scale * 3.5, rv * generator_scale * 3.5, 3, 2.0, 0.5);
+
+                                let raw_edge = if let Some(cm) = curvature_map {
+                                    let curv = cm.sample_bilinear(uv_mesh);
+                                    if curv > 0.505 { ((curv - 0.505) * 6.0).clamp(0.0, 1.0).powf(0.7) } else { 0.0 }
+                                } else {
+                                    (ridge * 0.7 + chip * 0.3).powf(2.0) * 0.85
+                                };
+
+                                let wear_core = (raw_edge * 1.8).clamp(0.0, 1.0);
+                                let wear_fringe = (raw_edge * 2.5 - 0.3).clamp(0.0, 1.0) * (0.35 * noise + 0.45 * chip + 0.20 * ridge);
+                                let wear = (wear_core * 0.65 + wear_fringe * 1.3).clamp(0.0, 1.0);
+                                (1.0 - wear * 0.75, 0.5 + wear * 0.3)
+                            }
+                            ProceduralGenerator::PositionGradient => {
+                                let pos_y = position_map
+                                    .map(|pm| pm.sample_bilinear(uv_mesh).y)
+                                    .unwrap_or(rv);
+                                (pos_y, pos_y)
+                            }
+                            ProceduralGenerator::DirectionalDust => {
+                                let norm_y = normal_map
+                                    .map(|nm| nm.sample_bilinear(uv_mesh).y * 2.0 - 1.0)
+                                    .unwrap_or(0.85);
+                                let ao = ao_map.map(|am| am.sample_bilinear(uv_mesh)).unwrap_or(1.0);
+                                let billow = NoiseGenerator::billow_2d(ru * generator_scale * 1.5, rv * generator_scale * 1.5, 3, 2.0, 0.5);
+                                let fine_dust = NoiseGenerator::splatter_spots_2d(ru * generator_scale * 4.0, rv * generator_scale * 4.0);
+
+                                let facing_up = (norm_y - 0.1).max(0.0).powf(0.6).clamp(0.0, 1.0);
+                                let pocket_boost = 0.7 + (1.0 - ao) * 0.6;
+                                let dust = (facing_up * (0.35 + 0.40 * billow + 0.25 * fine_dust) * pocket_boost).clamp(0.0, 1.0);
+                                (1.0 - dust * 0.4, 0.5 + dust * 0.1)
+                            }
+                            ProceduralGenerator::Checkerboard => {
+                                let cx = (ru * generator_scale).floor() as i32;
+                                let cy = (rv * generator_scale).floor() as i32;
+                                let val = if (cx + cy) % 2 == 0 { 0.9 } else { 0.2 };
+                                (val, val)
+                            }
+                            ProceduralGenerator::Bricks => {
+                                let scaled_y = rv * generator_scale;
+                                let row = scaled_y.floor() as i32;
+                                let offset_x = if row % 2 != 0 { 0.5 } else { 0.0 };
+                                let scaled_x = ru * generator_scale + offset_x;
+                                let fx = (scaled_x - scaled_x.floor()).abs();
+                                let fy = (scaled_y - scaled_y.floor()).abs();
+                                let is_mortar = fx < 0.07 || fy < 0.07;
+                                let val = if is_mortar { 0.2 } else { 0.85 };
+                                (val, if is_mortar { 0.1 } else { 0.6 })
+                            }
+                            ProceduralGenerator::AmbientOcclusion => {
+                                let ao_val = ao_map.map(|am| am.sample_bilinear(uv_mesh)).unwrap_or(0.85);
+                                let curv_val = curvature_map.map(|cm| cm.sample_bilinear(uv_mesh)).unwrap_or(0.5);
+                                let grunge = NoiseGenerator::domain_warp_2d(ru * generator_scale * 1.2, rv * generator_scale * 1.2);
+                                let splatter = NoiseGenerator::splatter_spots_2d(ru * generator_scale * 2.5, rv * generator_scale * 2.5);
+
+                                let crevice_ao = (1.0 - ao_val).clamp(0.0, 1.0).powf(0.8);
+                                let crevice_curv = if curv_val < 0.495 { ((0.495 - curv_val) * 4.5).clamp(0.0, 1.0).powf(0.7) } else { 0.0 };
+                                let crevice = (crevice_ao * 1.5 + crevice_curv * 1.2).clamp(0.0, 1.0);
+
+                                let sediment = 0.40 + 0.35 * grunge + 0.25 * splatter;
+                                let factor = (crevice * sediment * 1.6).clamp(0.0, 1.0);
+                                (1.0 - factor * 0.7, 0.5 + factor * 0.2)
+                            }
+                            ProceduralGenerator::DrippingLeaks => {
+                                let drip = NoiseGenerator::dripping_leaks_2d(ru * generator_scale, rv * generator_scale);
+                                (1.0 - drip * 0.6, 0.5 - drip * 0.1)
+                            }
+                            ProceduralGenerator::PeelingPaint => {
+                                let peel = NoiseGenerator::peeling_paint_2d(ru * generator_scale, rv * generator_scale);
+                                (1.0 - peel * 0.35, 0.5 + peel * 0.25)
+                            }
+                            ProceduralGenerator::RustPits => {
+                                let pit = NoiseGenerator::rust_crater_2d(ru * generator_scale, rv * generator_scale);
+                                (1.0 - pit * 0.5, (0.5 - pit * 0.35).clamp(0.0, 1.0))
+                            }
+                            ProceduralGenerator::MetalEdgeHighlight => {
+                                let curv = curvature_map.map(|cm| cm.sample_bilinear(uv_mesh)).unwrap_or(0.5);
+                                let edge = if curv > 0.515 { ((curv - 0.515) * 8.0).clamp(0.0, 1.0).powf(1.4) } else { 0.0 };
+                                (1.0 + edge * 0.3, 0.5 + edge * 0.15)
+                            }
+                            ProceduralGenerator::GroundSplash => {
+                                let pos_y = position_map.map(|pm| pm.sample_bilinear(uv_mesh).y).unwrap_or(rv);
+                                let splash = (1.0 - pos_y).clamp(0.0, 1.0).powf(1.8) * NoiseGenerator::splatter_spots_2d(ru * generator_scale, rv * generator_scale);
+                                (1.0 - splash * 0.4, 0.5 + splash * 0.2)
+                            }
+                            ProceduralGenerator::PerforatedMesh => {
+                                let scaled_y = rv * generator_scale * 1.73205;
+                                let row = scaled_y.floor() as i32;
+                                let offset_x = if row % 2 != 0 { 0.5 } else { 0.0 };
+                                let scaled_x = ru * generator_scale + offset_x;
+                                let fx = (scaled_x - scaled_x.floor()) - 0.5;
+                                let fy = (scaled_y - scaled_y.floor()) - 0.5;
+                                let dist = (fx * fx + fy * fy).sqrt();
+                                let is_hole = dist < 0.36;
+                                let val = if is_hole { 0.1 } else { 0.95 };
+                                (val, if is_hole { 0.1 } else { 0.6 })
+                            }
+                            ProceduralGenerator::WireFence => {
+                                let rot_u = (ru + rv) * 0.7071 * generator_scale;
+                                let rot_v = (rv - ru) * 0.7071 * generator_scale;
+                                let fx = (rot_u - rot_u.floor() - 0.5).abs();
+                                let fy = (rot_v - rot_v.floor() - 0.5).abs();
+                                let wire_thickness = 0.09;
+                                let wire = (wire_thickness - fx).max(wire_thickness - fy);
+                                let is_wire = wire > 0.0;
+                                let val = if is_wire { 0.95 } else { 0.1 };
+                                (val, if is_wire { 0.7 } else { 0.2 })
+                            }
+                            ProceduralGenerator::TornFabricEdge => {
+                                let fbm = NoiseGenerator::fbm_2d(ru * generator_scale * 3.0, rv * generator_scale * 3.0, 4, 2.0, 0.5);
+                                let fibers = NoiseGenerator::ridged_fbm_2d(ru * generator_scale * 12.0, rv * generator_scale * 12.0, 3, 2.0, 0.5);
+                                let v_center = (rv - 0.5).abs() * 2.0;
+                                let tear = v_center + (fbm - 0.5) * 0.7 + (fibers - 0.5) * 0.25;
+                                let is_solid = tear >= 0.5;
+                                (if is_solid { 0.9 } else { 0.1 }, if is_solid { 0.5 + fibers * 0.2 } else { 0.1 })
+                            }
+                            ProceduralGenerator::CircularDots => {
+                                let fx = (ru * generator_scale - (ru * generator_scale).floor()) - 0.5;
+                                let fy = (rv * generator_scale - (rv * generator_scale).floor()) - 0.5;
+                                let dist = (fx * fx + fy * fy).sqrt();
+                                let is_hole = dist < 0.32;
+                                (if is_hole { 0.1 } else { 0.9 }, if is_hole { 0.1 } else { 0.55 })
+                            }
+                            ProceduralGenerator::BnWSpots1 => {
+                                let n = NoiseGenerator::bnw_spots_1_2d(ru * generator_scale, rv * generator_scale);
+                                (n, n)
+                            }
+                            ProceduralGenerator::BnWSpots2 => {
+                                let n = NoiseGenerator::bnw_spots_2_2d(ru * generator_scale, rv * generator_scale);
+                                (n, n)
+                            }
+                            ProceduralGenerator::BnWSpots3 => {
+                                let n = NoiseGenerator::bnw_spots_3_2d(ru * generator_scale, rv * generator_scale);
+                                (n, n)
+                            }
+                            ProceduralGenerator::GrungeMap => {
+                                let n = NoiseGenerator::grunge_map_2d(ru * generator_scale, rv * generator_scale);
+                                (n, n)
+                            }
+                            ProceduralGenerator::DirectionalNoise => {
+                                let n = NoiseGenerator::directional_noise_2d(ru * generator_scale, rv * generator_scale, 0.785);
+                                (n, n)
+                            }
+                            ProceduralGenerator::Clouds => {
+                                let n = NoiseGenerator::clouds_noise_2d(ru * generator_scale, rv * generator_scale);
+                                (n, n)
+                            }
+                            ProceduralGenerator::MarbleVeins => {
+                                let n = NoiseGenerator::marble_veins_2d(ru * generator_scale, rv * generator_scale);
+                                (n, n)
+                            }
+                            ProceduralGenerator::MoistureNoise => {
+                                let n = NoiseGenerator::moisture_noise_2d(ru * generator_scale, rv * generator_scale);
+                                (n, n)
+                            }
+                        }
+                    };
+
+                    let (eff_noise, eff_bump) = if fill_generator != ProceduralGenerator::None {
+                        let contrasted = ((noise_factor - 0.5) * generator_contrast + 0.5).clamp(0.0, 1.0);
+                        let final_noise = if generator_invert { 1.0 - contrasted } else { contrasted };
+                        let final_bump = if generator_invert { 1.0 - bump_factor } else { bump_factor };
+                        (final_noise, final_bump)
+                    } else {
+                        (1.0, 0.5)
+                    };
+
+                    let col = if fill_generator == ProceduralGenerator::None {
+                        fill_color
+                    } else {
+                        Vec4::new(
+                            (fill_color.x * eff_noise).clamp(0.0, 1.0),
+                            (fill_color.y * eff_noise).clamp(0.0, 1.0),
+                            (fill_color.z * eff_noise).clamp(0.0, 1.0),
+                            fill_color.w,
+                        )
+                    };
+
+                    let rough = if fill_generator == ProceduralGenerator::None {
+                        fill_roughness
+                    } else {
+                        (fill_roughness * (0.65 + 0.7 * eff_noise)).clamp(0.0, 1.0)
+                    };
+
+                    let metal = fill_metallic;
+
+                    let height = if fill_generator == ProceduralGenerator::None {
+                        fill_height
+                    } else {
+                        (fill_height + (eff_bump - 0.5) * 0.4).clamp(0.0, 1.0)
+                    };
+
+                    // UV coords for texture sampling (already includes scale/offset/rotation)
+                    let tx = (ru.rem_euclid(1.0) * w as f32).clamp(0.0, w as f32 - 1.0) as u32;
+                    let ty = (rv.rem_euclid(1.0) * h as f32).clamp(0.0, h as f32 - 1.0) as u32;
+
+                    let final_col = if let Some(tex) = fill_color_tex {
+                        let t = tex.get_pixel(tx, ty);
+                        Vec4::new(
+                            (t.x * eff_noise).clamp(0.0, 1.0),
+                            (t.y * eff_noise).clamp(0.0, 1.0),
+                            (t.z * eff_noise).clamp(0.0, 1.0),
+                            t.w,
+                        )
+                    } else {
+                        col
+                    };
+
+                    let final_rough = if let Some(tex) = fill_roughness_tex {
+                        tex.get_pixel(tx, ty)
+                    } else {
+                        rough
+                    };
+
+                    let final_metal = if let Some(tex) = fill_metallic_tex {
+                        tex.get_pixel(tx, ty)
+                    } else {
+                        metal
+                    };
+
+                    let final_emissive = if let Some(tex) = fill_emissive_tex {
+                        let t = tex.get_pixel(tx, ty);
+                        Vec4::new(
+                            t.x * fill_emissive.x,
+                            t.y * fill_emissive.y,
+                            t.z * fill_emissive.z,
+                            t.w * fill_emissive.w,
+                        )
+                    } else {
+                        fill_emissive
+                    };
+
+                    let final_opacity = if let Some(tex) = fill_opacity_tex {
+                        tex.get_pixel(tx, ty) * fill_opacity
+                    } else {
+                        fill_opacity
+                    };
+ 
+                    let final_height = if let Some(tex) = fill_height_tex {
+                        tex.get_pixel(tx, ty)
+                    } else {
+                        height
+                    };
+
+                    let xi = x as usize;
+                    base_row[xi] = final_col;
+                    rough_row[xi] = final_rough;
+                    metal_row[xi] = final_metal;
+                    height_row[xi] = final_height;
+                    emissive_row[xi] = final_emissive;
+                    opacity_row[xi] = final_opacity;
+                }
+            });
+
+        // Generate tangent normal map from height variations and imported normal texture
+        if self.fill_normal_tex.is_some() || self.fill_height_tex.is_some() || self.fill_generator != ProceduralGenerator::None {
+            self.update_normal_from_height(self.fill_normal_strength);
+        } else {
+            self.normal_buf.data.fill(glam::Vec4::new(0.5, 0.5, 1.0, 1.0));
+        }
+        self.mark_dirty_full();
+    }
+
+    /// Update normal_buf from height_buf across the entire layer in parallel using Rayon
+    pub fn update_normal_from_height(&mut self, strength: f32) {
+        let w = self.height_buf.width;
+        let h = self.height_buf.height;
+        if w < 2 || h < 2 {
+            return;
+        }
+
+        let rad = self.uv_rotation.to_radians();
+        let (sin_r, cos_r) = rad.sin_cos();
+        let uv_scale = self.uv_scale.max(0.001);
+        let uv_offset = self.uv_offset;
+        let norm_tex_opt = self.fill_normal_tex.as_ref();
+        let height_buf = &self.height_buf;
+
+        self.normal_buf.data
+            .par_chunks_exact_mut(w as usize)
+            .enumerate()
+            .for_each(|(y, norm_row)| {
+                let y = y as u32;
+                let ym = if y > 0 { y - 1 } else { h - 1 };
+                let yp = if y + 1 < h { y + 1 } else { 0 };
+
+                for x in 0..w {
+                    let xm = if x > 0 { x - 1 } else { w - 1 };
+                    let xp = if x + 1 < w { x + 1 } else { 0 };
+
+                    let h_tl = height_buf.get_pixel(xm, yp);
+                    let h_tc = height_buf.get_pixel(x, yp);
+                    let h_tr = height_buf.get_pixel(xp, yp);
+                    let h_ml = height_buf.get_pixel(xm, y);
+                    let h_mr = height_buf.get_pixel(xp, y);
+                    let h_bl = height_buf.get_pixel(xm, ym);
+                    let h_bc = height_buf.get_pixel(x, ym);
+                    let h_br = height_buf.get_pixel(xp, ym);
+
+                    let sobel_x = (h_tr + 2.0 * h_mr + h_br) - (h_tl + 2.0 * h_ml + h_bl);
+                    let sobel_y = (h_tl + 2.0 * h_tc + h_tr) - (h_bl + 2.0 * h_bc + h_br);
+
+                    let dx = (sobel_x / 8.0) * strength * 4.0;
+                    let dy = (sobel_y / 8.0) * strength * 4.0;
+                    let bump_n = glam::Vec3::new(-dx, -dy, 1.0).normalize();
+
+                    let final_n = if let Some(norm_tex) = norm_tex_opt {
+                        let u_base = (x as f32 / w as f32) + uv_offset.x;
+                        let v_base = (y as f32 / h as f32) + uv_offset.y;
+                        let cu = u_base - 0.5;
+                        let cv = v_base - 0.5;
+                        let ru = (cu * cos_r - cv * sin_r + 0.5) * uv_scale;
+                        let rv = (cu * sin_r + cv * cos_r + 0.5) * uv_scale;
+                        let tx = (ru.rem_euclid(1.0) * norm_tex.width as f32).clamp(0.0, norm_tex.width as f32 - 1.0) as u32;
+                        let ty = (rv.rem_euclid(1.0) * norm_tex.height as f32).clamp(0.0, norm_tex.height as f32 - 1.0) as u32;
+                        let base_sample = norm_tex.get_pixel(tx, ty);
+                        let base_n = (base_sample.truncate() * 2.0 - glam::Vec3::ONE).normalize_or_zero();
+
+                        if base_n.length_squared() > 1e-4 {
+                            let t = base_n + glam::Vec3::Z;
+                            let u = glam::Vec3::new(-bump_n.x, -bump_n.y, bump_n.z);
+                            let nz = t.z.max(0.001);
+                            (t * (t.dot(u) / nz) - u).normalize()
+                        } else {
+                            bump_n
+                        }
+                    } else {
+                        bump_n
+                    };
+
+                    let cur_h = height_buf.get_pixel(x, y);
+                    norm_row[x as usize] = glam::Vec4::new(final_n.x * 0.5 + 0.5, final_n.y * 0.5 + 0.5, final_n.z * 0.5 + 0.5, cur_h);
+                }
+            });
+    }
+
+    /// Update normal_buf from height_buf within a bounded bounding box with 8-neighbor Sobel filtering and RNM blending
+    pub fn update_normal_from_height_rect(&mut self, min_x: u32, min_y: u32, max_x: u32, max_y: u32, strength: f32) {
+        let w = self.height_buf.width;
+        let h = self.height_buf.height;
+        if w < 2 || h < 2 {
+            return;
+        }
+
+        let x_start = min_x.saturating_sub(1);
+        let x_end = (max_x + 1).min(w - 1);
+        let y_start = min_y.saturating_sub(1);
+        let y_end = (max_y + 1).min(h - 1);
+
+        let rad = self.uv_rotation.to_radians();
+        let (sin_r, cos_r) = rad.sin_cos();
+        let uv_scale = self.uv_scale.max(0.001);
+
+        for y in y_start..=y_end {
+            let ym = if y > 0 { y - 1 } else { h - 1 };
+            let yp = if y + 1 < h { y + 1 } else { 0 };
+
+            for x in x_start..=x_end {
+                let xm = if x > 0 { x - 1 } else { w - 1 };
+                let xp = if x + 1 < w { x + 1 } else { 0 };
+
+                // 8-neighbor Sobel gradient for smooth, noise-free height-to-normal conversion
+                let h_tl = self.height_buf.get_pixel(xm, yp);
+                let h_tc = self.height_buf.get_pixel(x, yp);
+                let h_tr = self.height_buf.get_pixel(xp, yp);
+                let h_ml = self.height_buf.get_pixel(xm, y);
+                let h_mr = self.height_buf.get_pixel(xp, y);
+                let h_bl = self.height_buf.get_pixel(xm, ym);
+                let h_bc = self.height_buf.get_pixel(x, ym);
+                let h_br = self.height_buf.get_pixel(xp, ym);
+
+                let sobel_x = (h_tr + 2.0 * h_mr + h_br) - (h_tl + 2.0 * h_ml + h_bl);
+                let sobel_y = (h_tl + 2.0 * h_tc + h_tr) - (h_bl + 2.0 * h_bc + h_br);
+
+                let dx = (sobel_x / 8.0) * strength * 4.0;
+                let dy = (sobel_y / 8.0) * strength * 4.0;
+                let bump_n = glam::Vec3::new(-dx, -dy, 1.0).normalize();
+
+                // If imported normal texture is present, blend via Reoriented Normal Mapping (RNM)
+                let final_n = if let Some(ref norm_tex) = self.fill_normal_tex {
+                    let u_base = (x as f32 / w as f32) + self.uv_offset.x;
+                    let v_base = (y as f32 / h as f32) + self.uv_offset.y;
+                    let cu = u_base - 0.5;
+                    let cv = v_base - 0.5;
+                    let ru = (cu * cos_r - cv * sin_r + 0.5) * uv_scale;
+                    let rv = (cu * sin_r + cv * cos_r + 0.5) * uv_scale;
+                    let tx = (ru.rem_euclid(1.0) * norm_tex.width as f32).clamp(0.0, norm_tex.width as f32 - 1.0) as u32;
+                    let ty = (rv.rem_euclid(1.0) * norm_tex.height as f32).clamp(0.0, norm_tex.height as f32 - 1.0) as u32;
+                    let base_sample = norm_tex.get_pixel(tx, ty);
+                    let base_n = (base_sample.truncate() * 2.0 - glam::Vec3::ONE).normalize_or_zero();
+
+                    if base_n.length_squared() > 1e-4 {
+                        let t = base_n + glam::Vec3::Z;
+                        let u = glam::Vec3::new(-bump_n.x, -bump_n.y, bump_n.z);
+                        let nz = t.z.max(0.001);
+                        (t * (t.dot(u) / nz) - u).normalize()
+                    } else {
+                        bump_n
+                    }
+                } else {
+                    bump_n
+                };
+
+                let cur_h = self.height_buf.get_pixel(x, y);
+                self.normal_buf.set_pixel(
+                    x,
+                    y,
+                    Vec4::new(final_n.x * 0.5 + 0.5, final_n.y * 0.5 + 0.5, final_n.z * 0.5 + 0.5, cur_h),
+                );
+            }
+        }
+    }
+}
+
+/// Composite texture set holding final blended PBR maps
+#[derive(Clone, Debug)]
+pub struct CompositeTextureSet {
+    pub width: u32,
+    pub height: u32,
+    pub base_color: RgbaBuffer,
+    pub roughness: ScalarBuffer,
+    pub metallic: ScalarBuffer,
+    pub normal: RgbaBuffer,
+    pub height_map: ScalarBuffer,
+    pub ao: ScalarBuffer,
+    pub emissive: RgbaBuffer,
+    pub opacity: ScalarBuffer,
+    pub clearcoat: ScalarBuffer,
+    pub anisotropy: ScalarBuffer,
+    pub anisotropy_angle: ScalarBuffer,
+}
+
+impl CompositeTextureSet {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            base_color: RgbaBuffer::new(width, height, Vec4::new(0.6, 0.6, 0.6, 1.0)),
+            roughness: ScalarBuffer::new(width, height, 0.45),
+            metallic: ScalarBuffer::new(width, height, 0.0),
+            normal: RgbaBuffer::new(width, height, Vec4::new(0.5, 0.5, 1.0, 0.5)),
+            height_map: ScalarBuffer::new(width, height, 0.5),
+            ao: ScalarBuffer::new(width, height, 1.0),
+            emissive: RgbaBuffer::new(width, height, Vec4::ZERO),
+            opacity: ScalarBuffer::new(width, height, 1.0),
+            clearcoat: ScalarBuffer::new(width, height, 0.0),
+            anisotropy: ScalarBuffer::new(width, height, 0.0),
+            anisotropy_angle: ScalarBuffer::new(width, height, 0.0),
+        }
+    }
+}
+
+impl Default for CompositeTextureSet {
+    fn default() -> Self {
+        Self::new(512, 512)
+    }
+}
+
+impl CompositeTextureSet {
+    pub fn composite_layers(&mut self, layers: &[Layer]) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.composite_layers_rect(layers, 0, 0, w - 1, h - 1);
+    }
+
+    pub fn composite_layers_rect(
+        &mut self,
+        layers: &[Layer],
+        min_x: usize,
+        min_y: usize,
+        max_x: usize,
+        max_y: usize,
+    ) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        if w == 0 || h == 0 || min_x >= w || min_y >= h {
+            return;
+        }
+        let max_x = max_x.min(w - 1);
+        let max_y = max_y.min(h - 1);
+        if min_x > max_x || min_y > max_y {
+            return;
+        }
+
+        let base_col_data = &mut self.base_color.data;
+        let rough_data = &mut self.roughness.data;
+        let metal_data = &mut self.metallic.data;
+        let norm_data = &mut self.normal.data;
+        let height_data = &mut self.height_map.data;
+        let ao_data = &mut self.ao.data;
+        let emissive_data = &mut self.emissive.data;
+        let opacity_data = &mut self.opacity.data;
+        let clearcoat_data = &mut self.clearcoat.data;
+        let aniso_data = &mut self.anisotropy.data;
+        let aniso_ang_data = &mut self.anisotropy_angle.data;
+
+        let row_start = min_y * w;
+        let row_count = (max_y - min_y + 1) * w;
+        if row_start + row_count > base_col_data.len() {
+            return;
+        }
+
+        base_col_data[row_start..row_start + row_count].par_chunks_mut(w)
+            .zip(rough_data[row_start..row_start + row_count].par_chunks_mut(w))
+            .zip(metal_data[row_start..row_start + row_count].par_chunks_mut(w))
+            .zip(norm_data[row_start..row_start + row_count].par_chunks_mut(w))
+            .zip(height_data[row_start..row_start + row_count].par_chunks_mut(w))
+            .zip(ao_data[row_start..row_start + row_count].par_chunks_mut(w))
+            .zip(emissive_data[row_start..row_start + row_count].par_chunks_mut(w))
+            .zip(opacity_data[row_start..row_start + row_count].par_chunks_mut(w))
+            .zip(clearcoat_data[row_start..row_start + row_count].par_chunks_mut(w))
+            .zip(aniso_data[row_start..row_start + row_count].par_chunks_mut(w))
+            .zip(aniso_ang_data[row_start..row_start + row_count].par_chunks_mut(w))
+            .enumerate()
+            .for_each(|(local_y, ((((((((((base_row, rough_row), metal_row), norm_row), height_row), ao_row), emissive_row), opacity_row), clearcoat_row), aniso_row), aniso_ang_row))| {
+                let y = min_y + local_y;
+                for x in min_x..=max_x {
+                    base_row[x] = glam::Vec4::new(0.5, 0.5, 0.55, 1.0);
+                    rough_row[x] = 0.5;
+                    metal_row[x] = 0.0;
+                    norm_row[x] = glam::Vec4::new(0.5, 0.5, 1.0, 0.5);
+                    height_row[x] = 0.5;
+                    ao_row[x] = 1.0;
+                    emissive_row[x] = glam::Vec4::ZERO;
+                    opacity_row[x] = 1.0;
+                    clearcoat_row[x] = 0.0;
+                    aniso_row[x] = 0.0;
+                    aniso_ang_row[x] = 0.0;
+                }
+
+                for layer in layers {
+                    if !layer.visible || layer.opacity <= 1e-4 || layer.layer_type == LayerType::Folder {
+                        continue;
+                    }
+
+                    let parent_folder = layer.parent_folder_id.and_then(|fid| layers.iter().find(|l| l.id == fid));
+                    if let Some(folder) = parent_folder {
+                        if !folder.visible || folder.opacity <= 1e-4 {
+                            continue;
+                        }
+                    }
+                    
+                    let mut ch_modes = layer.channel_blend_modes;
+                    if let Some(folder) = parent_folder {
+                        if folder.blend_mode != BlendMode::PassThrough {
+                            if folder.channel_blend_modes.base_color != BlendMode::PassThrough {
+                                ch_modes.base_color = folder.channel_blend_modes.base_color;
+                            } else {
+                                ch_modes.base_color = folder.blend_mode;
+                            }
+                            if folder.channel_blend_modes.roughness != BlendMode::PassThrough {
+                                ch_modes.roughness = folder.channel_blend_modes.roughness;
+                            }
+                            if folder.channel_blend_modes.metallic != BlendMode::PassThrough {
+                                ch_modes.metallic = folder.channel_blend_modes.metallic;
+                            }
+                            if folder.channel_blend_modes.normal != BlendMode::PassThrough {
+                                ch_modes.normal = folder.channel_blend_modes.normal;
+                            }
+                            if folder.channel_blend_modes.height != BlendMode::PassThrough {
+                                ch_modes.height = folder.channel_blend_modes.height;
+                            }
+                            if folder.channel_blend_modes.emission != BlendMode::PassThrough {
+                                ch_modes.emission = folder.channel_blend_modes.emission;
+                            }
+                            if folder.channel_blend_modes.opacity != BlendMode::PassThrough {
+                                ch_modes.opacity = folder.channel_blend_modes.opacity;
+                            }
+                        }
+                    }
+                    let ch_ops = layer.channel_opacities;
+                    let flags = layer.channel_flags;
+                    let mut layer_op = layer.opacity;
+                    if let Some(folder) = parent_folder {
+                        layer_op *= folder.opacity;
+                    }
+                    let is_paint_layer = layer.layer_type == LayerType::Paint;
+
+                    for x in min_x..=max_x {
+                        let idx2 = y * w + x;
+                        let mut mask_val = if layer.has_mask {
+                            let m = layer.mask_buf.data[idx2];
+                            if layer.mask_inverted { 1.0 - m } else { m }
+                        } else {
+                            1.0
+                        };
+
+                        if let Some(folder) = parent_folder {
+                            if folder.has_mask {
+                                let fm = folder.mask_buf.data[idx2];
+                                let f_val = if folder.mask_inverted { 1.0 - fm } else { fm };
+                                mask_val *= f_val;
+                            }
+                        }
+
+                        let paint_alpha = if is_paint_layer {
+                            layer.base_color_buf.data[idx2].w
+                        } else {
+                            1.0
+                        };
+
+                        let effective_opacity = layer_op * mask_val * paint_alpha;
+                        if effective_opacity <= 1e-4 { continue; }
+
+                        if flags.base_color {
+                            let op = effective_opacity * ch_ops.base_color;
+                            if op > 1e-4 {
+                                let src = layer.base_color_buf.data[idx2];
+                                base_row[x] = ch_modes.base_color.blend_color(base_row[x], src, op);
+                            }
+                        }
+
+                        if flags.roughness {
+                            let op = effective_opacity * ch_ops.roughness;
+                            if op > 1e-4 {
+                                let src = layer.roughness_buf.data[idx2];
+                                rough_row[x] = ch_modes.roughness.blend_scalar(rough_row[x], src, op);
+                            }
+                        }
+
+                        if flags.metallic {
+                            let op = effective_opacity * ch_ops.metallic;
+                            if op > 1e-4 {
+                                let src = layer.metallic_buf.data[idx2];
+                                metal_row[x] = ch_modes.metallic.blend_scalar(metal_row[x], src, op);
+                            }
+                        }
+
+                        if flags.normal {
+                            let op = effective_opacity * ch_ops.normal;
+                            if op > 1e-4 {
+                                let src = layer.normal_buf.data[idx2];
+                                norm_row[x] = ch_modes.normal.blend_color(norm_row[x], src, op);
+                            }
+                        }
+
+                        if flags.height {
+                            let op = effective_opacity * ch_ops.height;
+                            if op > 1e-4 {
+                                let src = layer.height_buf.data[idx2];
+                                height_row[x] = ch_modes.height.blend_scalar(height_row[x], src, op);
+                            }
+                        }
+
+                        if flags.emission {
+                            let op = effective_opacity * ch_ops.emission;
+                            if op > 1e-4 {
+                                let src = layer.emissive_buf.data[idx2];
+                                emissive_row[x] = ch_modes.emission.blend_color(emissive_row[x], src, op);
+                            }
+                        }
+
+                        if flags.opacity {
+                            let op = effective_opacity * ch_ops.opacity;
+                            if op > 1e-4 {
+                                let src = layer.opacity_buf.data[idx2];
+                                opacity_row[x] = ch_modes.opacity.blend_scalar(opacity_row[x], src, op);
+                            }
+                        }
+
+                        if flags.clearcoat {
+                            let op = effective_opacity * ch_ops.clearcoat;
+                            if op > 1e-4 {
+                                let src = layer.clearcoat_buf.data[idx2];
+                                clearcoat_row[x] = ch_modes.clearcoat.blend_scalar(clearcoat_row[x], src, op);
+                            }
+                        }
+
+                        if flags.anisotropy {
+                            let op = effective_opacity * ch_ops.anisotropy;
+                            if op > 1e-4 {
+                                let src_a = layer.anisotropy_buf.data[idx2];
+                                aniso_row[x] = ch_modes.anisotropy.blend_scalar(aniso_row[x], src_a, op);
+                                let src_ang = layer.anisotropy_angle_buf.data[idx2];
+                                aniso_ang_row[x] = ch_modes.anisotropy.blend_scalar(aniso_ang_row[x], src_ang, op);
+                            }
+                        }
+                    }
+                }
+
+                for x in min_x..=max_x {
+                    norm_row[x].w = height_row[x];
+                }
+            });
+
+        self.apply_height_to_normal_bump_rect(min_x as u32, min_y as u32, max_x as u32, max_y as u32, 4.0);
+    }
+
+    pub fn apply_height_to_normal_bump(&mut self, bump_strength: f32) {
+        let w = self.width;
+        let h = self.height;
+        if w < 2 || h < 2 {
+            return;
+        }
+        self.apply_height_to_normal_bump_rect(0, 0, w - 1, h - 1, bump_strength);
+    }
+
+    pub fn apply_height_to_normal_bump_rect(&mut self, min_x: u32, min_y: u32, max_x: u32, max_y: u32, bump_strength: f32) {
+        let w = self.width;
+        let h = self.height;
+        if w < 2 || h < 2 {
+            return;
+        }
+
+        let x_start = min_x.saturating_sub(1);
+        let x_end = (max_x + 1).min(w - 1);
+        let y_start = min_y.saturating_sub(1);
+        let y_end = (max_y + 1).min(h - 1);
+
+        let height_map = &self.height_map;
+        let norm_data = &mut self.normal.data;
+
+        let row_start = (y_start * w) as usize;
+        let row_count = ((y_end - y_start + 1) * w) as usize;
+        if row_start + row_count > norm_data.len() {
+            return;
+        }
+
+        norm_data[row_start..row_start + row_count]
+            .par_chunks_exact_mut(w as usize)
+            .enumerate()
+            .for_each(|(local_y, norm_row)| {
+                let y = y_start + local_y as u32;
+                let ym = if y > 0 { y - 1 } else { h - 1 };
+                let yp = if y + 1 < h { y + 1 } else { 0 };
+
+                for x in x_start..=x_end {
+                    let xm = if x > 0 { x - 1 } else { w - 1 };
+                    let xp = if x + 1 < w { x + 1 } else { 0 };
+
+                    let h_tl = height_map.get_pixel(xm, yp);
+                    let h_tc = height_map.get_pixel(x, yp);
+                    let h_tr = height_map.get_pixel(xp, yp);
+                    let h_ml = height_map.get_pixel(xm, y);
+                    let h_mr = height_map.get_pixel(xp, y);
+                    let h_bl = height_map.get_pixel(xm, ym);
+                    let h_bc = height_map.get_pixel(x, ym);
+                    let h_br = height_map.get_pixel(xp, ym);
+
+                    let sobel_x = (h_tr + 2.0 * h_mr + h_br) - (h_tl + 2.0 * h_ml + h_bl);
+                    let sobel_y = (h_tl + 2.0 * h_tc + h_tr) - (h_bl + 2.0 * h_bc + h_br);
+
+                    let dx = (sobel_x / 8.0) * bump_strength * 4.0;
+                    let dy = (sobel_y / 8.0) * bump_strength * 4.0;
+                    let bump_n = glam::Vec3::new(-dx, -dy, 1.0).normalize();
+
+                    let cur_norm_raw = norm_row[x as usize];
+                    let cur_n = (cur_norm_raw.truncate() * 2.0 - glam::Vec3::ONE).normalize_or_zero();
+
+                    let final_n = if cur_n.length_squared() > 1e-4 {
+                        let t = cur_n + glam::Vec3::Z;
+                        let u = glam::Vec3::new(-bump_n.x, -bump_n.y, bump_n.z);
+                        let nz = t.z.max(0.001);
+                        (t * (t.dot(u) / nz) - u).normalize()
+                    } else {
+                        bump_n
+                    };
+
+                    norm_row[x as usize] = glam::Vec4::new(
+                        final_n.x * 0.5 + 0.5,
+                        final_n.y * 0.5 + 0.5,
+                        final_n.z * 0.5 + 0.5,
+                        cur_norm_raw.w,
+                    );
+                }
+            });
+    }
+
+    /// Produce a standalone combined normal map (RGBA buffer) with height converted to normal
+    pub fn generate_combined_normal(&self, bump_strength: f32) -> RgbaBuffer {
+        let mut combined = self.normal.clone();
+        let w = self.width;
+        let h = self.height;
+        if w < 2 || h < 2 {
+            return combined;
+        }
+
+        let height_map = &self.height_map;
+        combined
+            .data
+            .par_chunks_exact_mut(w as usize)
+            .enumerate()
+            .for_each(|(y, norm_row)| {
+                let y = y as u32;
+                let ym = if y > 0 { y - 1 } else { h - 1 };
+                let yp = if y + 1 < h { y + 1 } else { 0 };
+
+                for x in 0..w {
+                    let xm = if x > 0 { x - 1 } else { w - 1 };
+                    let xp = if x + 1 < w { x + 1 } else { 0 };
+
+                    let h_tl = height_map.get_pixel(xm, yp);
+                    let h_tc = height_map.get_pixel(x, yp);
+                    let h_tr = height_map.get_pixel(xp, yp);
+                    let h_ml = height_map.get_pixel(xm, y);
+                    let h_mr = height_map.get_pixel(xp, y);
+                    let h_bl = height_map.get_pixel(xm, ym);
+                    let h_bc = height_map.get_pixel(x, ym);
+                    let h_br = height_map.get_pixel(xp, ym);
+
+                    let sobel_x = (h_tr + 2.0 * h_mr + h_br) - (h_tl + 2.0 * h_ml + h_bl);
+                    let sobel_y = (h_tl + 2.0 * h_tc + h_tr) - (h_bl + 2.0 * h_bc + h_br);
+
+                    let dx = (sobel_x / 8.0) * bump_strength * 4.0;
+                    let dy = (sobel_y / 8.0) * bump_strength * 4.0;
+                    let bump_n = glam::Vec3::new(-dx, -dy, 1.0).normalize();
+
+                    let cur_norm_raw = norm_row[x as usize];
+                    let cur_n = (cur_norm_raw.truncate() * 2.0 - glam::Vec3::ONE).normalize_or_zero();
+
+                    let final_n = if cur_n.length_squared() > 1e-4 {
+                        let t = cur_n + glam::Vec3::Z;
+                        let u = glam::Vec3::new(-bump_n.x, -bump_n.y, bump_n.z);
+                        let nz = t.z.max(0.001);
+                        (t * (t.dot(u) / nz) - u).normalize()
+                    } else {
+                        bump_n
+                    };
+
+                    norm_row[x as usize] = glam::Vec4::new(
+                        final_n.x * 0.5 + 0.5,
+                        final_n.y * 0.5 + 0.5,
+                        final_n.z * 0.5 + 0.5,
+                        1.0,
+                    );
+                }
+            });
+        combined
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fill_layer_initialization_and_evaluation() {
+        let mut fill = Layer::new_fill_layer(
+            1,
+            "Base Fill".to_string(),
+            64,
+            64,
+            Vec4::new(0.9, 0.2, 0.1, 1.0),
+            0.35,
+            0.85,
+        );
+
+        // Verify initial buffer values match fill settings
+        let c = fill.base_color_buf.get_pixel(32, 32);
+        assert!((c.x - 0.9).abs() < 1e-4);
+        assert!((c.y - 0.2).abs() < 1e-4);
+        assert!((c.z - 0.1).abs() < 1e-4);
+
+        let r = fill.roughness_buf.get_pixel(32, 32);
+        assert!((r - 0.35).abs() < 1e-4);
+
+        let m = fill.metallic_buf.get_pixel(32, 32);
+        assert!((m - 0.85).abs() < 1e-4);
+
+        // Manipulate properties like in Substance 3D Painter
+        fill.fill_color = Vec4::new(0.1, 0.5, 0.9, 1.0);
+        fill.fill_roughness = 0.75;
+        fill.fill_metallic = 0.0;
+        fill.fill_generator = ProceduralGenerator::Checkerboard;
+        fill.generator_scale = 4.0;
+        fill.uv_scale = 2.0;
+        fill.evaluate_fill(None);
+
+        // Buffers should reflect the new procedural evaluation
+        let new_c = fill.base_color_buf.get_pixel(10, 10);
+        assert!(new_c.x > 0.0);
+        assert!(fill.roughness_buf.get_pixel(10, 10) > 0.0);
+    }
+
+    #[test]
+    fn test_channel_flags_compositing_isolation() {
+        let mut comp = CompositeTextureSet::new(32, 32);
+
+        // Layer 1: Red plastic
+        let mut l1 = Layer::new_fill_layer(
+            1,
+            "Red Plastic".to_string(),
+            32,
+            32,
+            Vec4::new(1.0, 0.0, 0.0, 1.0),
+            0.8,
+            0.0,
+        );
+        l1.evaluate_fill(None);
+
+        // Layer 2: Gold metallic, but BaseColor channel DISABLED
+        let mut l2 = Layer::new_fill_layer(
+            2,
+            "Gold Metal Specular Only".to_string(),
+            32,
+            32,
+            Vec4::new(1.0, 0.84, 0.0, 1.0),
+            0.2,
+            1.0,
+        );
+        l2.channel_flags.base_color = false; // Disabled! Leaves lower color intact
+        l2.channel_flags.metallic = true;
+        l2.channel_flags.roughness = true;
+        l2.evaluate_fill(None);
+
+        comp.composite_layers(&[l1, l2]);
+
+        // Base color should still be red from layer 1!
+        let c = comp.base_color.get_pixel(16, 16);
+        assert!((c.x - 1.0).abs() < 1e-4, "Base color was not preserved from layer 1");
+        assert!(c.y < 0.1);
+
+        // But metallic should be 1.0 and roughness 0.2 from layer 2!
+        let m = comp.metallic.get_pixel(16, 16);
+        assert!((m - 1.0).abs() < 1e-4);
+        let r = comp.roughness.get_pixel(16, 16);
+        assert!((r - 0.2).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_mask_gating_behavior() {
+        let mut comp = CompositeTextureSet::new(32, 32);
+
+        // Base layer: Blue
+        let mut l1 = Layer::new_fill_layer(
+            1,
+            "Blue Base".to_string(),
+            32,
+            32,
+            Vec4::new(0.0, 0.0, 1.0, 1.0),
+            0.5,
+            0.0,
+        );
+        l1.evaluate_fill(None);
+
+        // Top layer: Green with black mask (completely hidden)
+        let mut l2 = Layer::new_fill_layer(
+            2,
+            "Hidden Green".to_string(),
+            32,
+            32,
+            Vec4::new(0.0, 1.0, 0.0, 1.0),
+            0.5,
+            0.0,
+        );
+        l2.add_black_mask();
+        l2.evaluate_fill(None);
+
+        comp.composite_layers(&[l1.clone(), l2.clone()]);
+        let c_black = comp.base_color.get_pixel(16, 16);
+        assert!((c_black.z - 1.0).abs() < 1e-4, "Black mask should hide top layer");
+
+        // Invert mask -> should reveal green!
+        l2.invert_mask();
+        comp.composite_layers(&[l1, l2]);
+        let c_inv = comp.base_color.get_pixel(16, 16);
+        assert!((c_inv.y - 1.0).abs() < 1e-4, "Inverted mask should reveal top layer");
+    }
+
+    #[test]
+    fn test_curvature_resolution_independence() {
+        // High resolution 128x128 curvature map with an edge band across the center
+        let mut curv = ScalarBuffer::new(128, 128, 0.5);
+        for y in 60..=68 {
+            for x in 0..128 {
+                curv.set_pixel(x, y, 1.0); // Ridge edge across horizontal center
+            }
+        }
+
+        // Lower resolution 32x32 layer
+        let mut layer = Layer::new_fill_layer(
+            1,
+            "Worn Layer".to_string(),
+            32,
+            32,
+            Vec4::ONE,
+            0.5,
+            0.0,
+        );
+        layer.add_curvature_mask(Some(&curv));
+
+        // The edge at y = 16 in the 32x32 buffer should detect wear from the 128x128 map
+        let mask_at_edge = layer.mask_buf.get_pixel(16, 16);
+        let mask_at_flat = layer.mask_buf.get_pixel(16, 4);
+
+        assert!(mask_at_edge > 0.1, "Edge wear should be detected across differing resolutions");
+        assert_eq!(mask_at_flat, 0.0, "Flat areas should have zero edge wear");
+    }
+
+    #[test]
+    fn test_layer_folder_hierarchy_and_compositing() {
+        let mut comp = CompositeTextureSet::new(16, 16);
+        let mut l_bg = Layer::new_fill_layer(1, "Background".to_string(), 16, 16, Vec4::new(0.0, 0.0, 1.0, 1.0), 0.5, 0.0);
+        l_bg.evaluate_fill(None);
+
+        let mut folder = Layer::new_folder_layer(2, "Folder".to_string(), 16, 16);
+        folder.opacity = 0.5;
+
+        let mut l_child = Layer::new_fill_layer(3, "Child".to_string(), 16, 16, Vec4::new(1.0, 0.0, 0.0, 1.0), 0.5, 0.0);
+        l_child.parent_folder_id = Some(2);
+        l_child.evaluate_fill(None);
+
+        comp.composite_layers(&[l_bg, folder, l_child]);
+        let pixel = comp.base_color.get_pixel(8, 8);
+        // With 50% opacity folder, red is blended over blue
+        assert!((pixel.x - 0.5).abs() < 1e-3, "Red channel should be scaled by folder opacity");
+        assert!((pixel.z - 0.5).abs() < 1e-3, "Blue channel should remain blended");
+    }
+
+    #[test]
+    fn test_folder_pass_through_and_blend_modes() {
+        let mut comp = CompositeTextureSet::new(16, 16);
+        let mut l_bg = Layer::new_fill_layer(1, "Background".to_string(), 16, 16, Vec4::new(0.5, 0.5, 0.5, 1.0), 0.5, 0.0);
+        l_bg.evaluate_fill(None);
+
+        let mut folder = Layer::new_folder_layer(2, "Folder".to_string(), 16, 16);
+        assert_eq!(folder.blend_mode, BlendMode::PassThrough);
+
+        let mut l_child = Layer::new_fill_layer(3, "Child".to_string(), 16, 16, Vec4::new(0.4, 0.4, 0.4, 1.0), 0.5, 0.0);
+        l_child.parent_folder_id = Some(2);
+        l_child.channel_blend_modes.base_color = BlendMode::Multiply;
+        l_child.evaluate_fill(None);
+
+        // In PassThrough mode, child's Multiply blend mode applies directly to the background
+        comp.composite_layers(&[l_bg.clone(), folder.clone(), l_child.clone()]);
+        let pixel_pt = comp.base_color.get_pixel(8, 8);
+        assert!((pixel_pt.x - 0.2).abs() < 1e-3, "Pass-through multiply: 0.5 * 0.4 = 0.2");
+
+        // When folder is switched to Add mode, folder overrides child
+        folder.blend_mode = BlendMode::Add;
+        comp.composite_layers(&[l_bg, folder, l_child]);
+        let pixel_add = comp.base_color.get_pixel(8, 8);
+        assert!((pixel_add.x - 0.9).abs() < 1e-3, "Folder Add mode: 0.5 + 0.4 = 0.9");
+    }
+
+    #[test]
+    fn test_procedural_filters_invert_and_levels() {
+        let mut layer = Layer::new_fill_layer(1, "Test".to_string(), 16, 16, Vec4::new(0.2, 0.4, 0.8, 1.0), 0.5, 0.0);
+        layer.evaluate_fill(None);
+
+        // Invert channels (target_mask: false)
+        layer.apply_filter_invert(false);
+        let pix = layer.base_color_buf.get_pixel(4, 4);
+        assert!((pix.x - 0.8).abs() < 1e-3, "Inverted 0.2 should be 0.8");
+        assert!((pix.y - 0.6).abs() < 1e-3, "Inverted 0.4 should be 0.6");
+
+        // Levels (target_mask: false)
+        layer.apply_filter_levels(0.0, 1.0, 2.0, 0.0, 1.0, false);
+        let pix_lev = layer.base_color_buf.get_pixel(4, 4);
+        assert!((pix_lev.x - 0.8_f32.powf(0.5)).abs() < 1e-3, "Gamma adjustment of 2.0 (inv_gamma 0.5) should be applied");
+    }
+
+    #[test]
+    fn test_mask_stack_additive_modifiers() {
+        let mut layer = Layer::new_fill_layer(1, "Masked".to_string(), 16, 16, Vec4::ONE, 0.5, 0.0);
+        layer.clear_mask(0.0);
+
+        // Add first fill effect
+        layer.add_mask_fill_effect_advanced(ProceduralGenerator::PerlinNoise, None, None, None, None);
+        let val_1 = layer.mask_buf.get_pixel(8, 8);
+        assert!(val_1 > 0.0, "First mask effect should generate non-zero values");
+
+        // Add second fill effect: should default to Additive blend mode
+        layer.add_mask_fill_effect_advanced(ProceduralGenerator::WorleyGrunge, None, None, None, None);
+        assert_eq!(layer.mask_effects.len(), 2);
+        assert_eq!(layer.mask_effects[1].blend_mode, BlendMode::Add, "Subsequent mask effect should default to Additive");
+
+        let val_2 = layer.mask_buf.get_pixel(8, 8);
+        assert!(val_2 >= val_1, "Additive second effect must add onto the mask without replacing or zeroing the old one");
+    }
+
+    #[test]
+    fn test_mask_paint_preservation() {
+        let mut layer = Layer::new_fill_layer(1, "HandPaintedMask".to_string(), 16, 16, Vec4::ONE, 0.5, 0.0);
+        layer.clear_mask(0.0);
+        // Paint a stroke directly on the mask
+        layer.mask_buf.set_pixel(4, 4, 0.95);
+
+        // Now add a procedural effect or smart mask: existing paint must be preserved
+        layer.preserve_base_paint_if_needed();
+        assert_eq!(layer.mask_effects.len(), 1, "Hand painted mask should be preserved into a Base Paint effect");
+        assert_eq!(layer.mask_effects[0].name, "Base Paint");
+
+        // Add a blur filter onto the mask stack
+        layer.add_mask_filter_blur(1.5, None);
+        assert_eq!(layer.mask_effects.len(), 2);
+        let pix = layer.mask_buf.get_pixel(4, 4);
+        assert!(pix > 0.1, "Preserved painted stroke must still be present after evaluating stack");
+    }
+
+    #[test]
+    fn test_mask_filters_and_generators() {
+        let mut layer = Layer::new_fill_layer(1, "FilterTest".to_string(), 16, 16, Vec4::new(0.5, 0.5, 0.5, 1.0), 0.5, 0.0);
+        layer.clear_mask(0.5);
+
+        // Test contrast & brightness
+        layer.apply_filter_contrast_brightness(2.0, 0.1, true);
+        let val = layer.mask_buf.get_pixel(0, 0);
+        assert!((val - 0.7).abs() < 1e-2, "0.5 + 0.1 brightness, then (0.6 - 0.5)*2 + 0.5 = 0.7");
+
+        // Test high-pass
+        layer.apply_filter_high_pass(1.0, true);
+        let val_hp = layer.mask_buf.get_pixel(0, 0);
+        assert!((val_hp - 0.5).abs() < 1e-2, "Flat buffer high-pass should isolate neutral 0.5");
+
+        // Test AO and Leaks generators in procedural mask evaluation
+        let ao_map = ScalarBuffer::new(16, 16, 0.2); // deep crevice
+        let gen_ao = Layer::generate_mask_procedural(
+            ProceduralGenerator::AmbientOcclusion,
+            4.0,
+            1.0,
+            false,
+            0.5,
+            16,
+            16,
+            None,
+            Some(&ao_map),
+            None,
+            None,
+        );
+        let ao_crevice = gen_ao.get_pixel(8, 8);
+        assert!(ao_crevice > 0.3, "Ambient occlusion generator should detect crevice from ao_map");
+
+        // Verify all generators in ProceduralGenerator::all() evaluate without panics
+        for gen in ProceduralGenerator::all() {
+            let buf = Layer::generate_mask_procedural(*gen, 8.0, 1.0, false, 0.5, 16, 16, None, None, None, None);
+            assert_eq!(buf.width, 16);
+            assert_eq!(buf.height, 16);
+            assert!(buf.data.iter().all(|&v| v >= 0.0 && v <= 1.0));
+        }
+    }
+
+    #[test]
+    fn test_opacity_channel_procedurals_and_fill() {
+        let opacity_generators = [
+            ProceduralGenerator::PerforatedMesh,
+            ProceduralGenerator::WireFence,
+            ProceduralGenerator::TornFabricEdge,
+            ProceduralGenerator::CircularDots,
+        ];
+
+        for gen in opacity_generators {
+            let buf = Layer::generate_mask_procedural(gen, 10.0, 1.5, false, 0.5, 32, 32, None, None, None, None);
+            assert_eq!(buf.width, 32);
+            assert_eq!(buf.height, 32);
+            assert!(buf.data.iter().all(|&v| (0.0..=1.0).contains(&v)), "Generator {:?} produced out-of-range values", gen);
+        }
+
+        // Test fill layer with opacity channel
+        let mut layer = Layer::new_fill_layer(
+            1,
+            "Opacity Fill".to_string(),
+            32,
+            32,
+            Vec4::ONE,
+            0.2,
+            0.0,
+        );
+        layer.fill_opacity = 0.42;
+        layer.channel_flags.opacity = true;
+        layer.evaluate_fill(None);
+
+        assert!((layer.opacity_buf.get_pixel(16, 16) - 0.42).abs() < 1e-4, "Fill opacity buffer did not reflect fill_opacity");
+
+        let mut comp = CompositeTextureSet::new(32, 32);
+        comp.composite_layers(&[layer]);
+        assert!((comp.opacity.get_pixel(16, 16) - 0.42).abs() < 1e-4, "Composite opacity did not blend layer opacity");
+    }
+
+    #[test]
+    fn test_stroke_snapshot_optimization() {
+        let mut layer = Layer::new_fill_layer(
+            1,
+            "Optimized Layer".to_string(),
+            32,
+            32,
+            Vec4::ONE,
+            0.5,
+            0.0,
+        );
+        // Simulate heavy static texture map
+        let heavy_tex = RgbaBuffer::new(32, 32, Vec4::new(0.8, 0.2, 0.1, 1.0));
+        layer.fill_color_tex = Some(heavy_tex);
+
+        // Paint a pixel
+        layer.base_color_buf.set_pixel(10, 10, Vec4::new(1.0, 0.0, 0.0, 1.0));
+
+        // Create stroke snapshot
+        let snapshot = layer.clone_stroke_snapshot();
+
+        // Verify heavy static texture was skipped in snapshot (saving memory and latency)
+        assert!(snapshot.fill_color_tex.is_none(), "Stroke snapshot should not duplicate heavy static fill textures");
+        assert_eq!(snapshot.base_color_buf.get_pixel(10, 10), Vec4::new(1.0, 0.0, 0.0, 1.0));
+
+        // Now mutate original layer (simulate active painting stroke)
+        layer.base_color_buf.set_pixel(10, 10, Vec4::new(0.0, 1.0, 0.0, 1.0));
+        assert_eq!(layer.base_color_buf.get_pixel(10, 10), Vec4::new(0.0, 1.0, 0.0, 1.0));
+
+        // Restore stroke snapshot (simulate undo)
+        layer.restore_stroke_snapshot(&snapshot);
+
+        // Verify painted buffer was restored while target's static texture map remained intact
+        assert_eq!(layer.base_color_buf.get_pixel(10, 10), Vec4::new(1.0, 0.0, 0.0, 1.0));
+        assert!(layer.fill_color_tex.is_some(), "Restoring stroke snapshot must preserve target's fill textures");
+    }
+
+    #[test]
+    fn test_solid_fill_fast_path_and_parallel_noise() {
+        let mut layer = Layer::new_fill_layer(
+            1,
+            "Solid Fill".to_string(),
+            64,
+            64,
+            Vec4::new(0.2, 0.4, 0.8, 1.0),
+            0.35,
+            0.75,
+        );
+        layer.fill_clearcoat = 0.5;
+        layer.fill_anisotropy = 0.6;
+        layer.fill_anisotropy_angle = 0.25;
+
+        // Evaluate solid fill (triggers SIMD fast-path)
+        layer.evaluate_fill_advanced(None, None, None, None);
+
+        assert_eq!(layer.base_color_buf.get_pixel(0, 0), Vec4::new(0.2, 0.4, 0.8, 1.0));
+        assert_eq!(layer.base_color_buf.get_pixel(63, 63), Vec4::new(0.2, 0.4, 0.8, 1.0));
+        assert_eq!(layer.roughness_buf.get_pixel(32, 32), 0.35);
+        assert_eq!(layer.metallic_buf.get_pixel(32, 32), 0.75);
+        assert_eq!(layer.clearcoat_buf.get_pixel(32, 32), 0.5);
+        assert_eq!(layer.anisotropy_buf.get_pixel(32, 32), 0.6);
+        assert_eq!(layer.anisotropy_angle_buf.get_pixel(32, 32), 0.25);
+        assert_eq!(layer.normal_buf.get_pixel(0, 0), Vec4::new(0.5, 0.5, 1.0, 1.0));
+
+        // Now test procedural fill with Perlin Noise (triggers Rayon parallel evaluation)
+        layer.fill_generator = ProceduralGenerator::PerlinNoise;
+        layer.generator_scale = 4.0;
+        layer.evaluate_fill_advanced(None, None, None, None);
+
+        // Procedural noise will vary across pixels
+        let c0 = layer.base_color_buf.get_pixel(0, 0);
+        let c1 = layer.base_color_buf.get_pixel(32, 32);
+        assert!(c0.w == 1.0);
+        assert!(c1.w == 1.0);
+        assert!(c0.x >= 0.0 && c0.x <= 1.0);
+
+        // Test Rayon parallel normal map generation from height
+        layer.update_normal_from_height(1.0);
+        let n0 = layer.normal_buf.get_pixel(10, 10);
+        assert!(n0.x >= 0.0 && n0.x <= 1.0);
+        assert!(n0.y >= 0.0 && n0.y <= 1.0);
+        assert!(n0.z >= 0.0 && n0.z <= 1.0);
+    }
+
+    #[test]
+    fn test_per_channel_blend_modes_and_opacities() {
+        let mut layer_base = Layer::new_fill_layer(1, "Base".to_string(), 16, 16, Vec4::new(0.2, 0.2, 0.2, 1.0), 0.5, 0.0);
+        layer_base.fill_height = 0.3;
+        layer_base.set_channel_blend_mode(ChannelType::Height, BlendMode::Normal);
+        layer_base.evaluate_fill_advanced(None, None, None, None);
+
+        let mut layer_top = Layer::new_fill_layer(2, "Top".to_string(), 16, 16, Vec4::new(0.8, 0.1, 0.1, 1.0), 0.5, 0.0);
+        layer_top.fill_height = 0.4;
+        layer_top.evaluate_fill_advanced(None, None, None, None);
+
+        // Configure per-channel blend modes: BaseColor = Normal, Height = Add
+        layer_top.set_channel_blend_mode(ChannelType::BaseColor, BlendMode::Normal);
+        layer_top.set_channel_blend_mode(ChannelType::Height, BlendMode::Add);
+
+        let layers = vec![layer_base, layer_top.clone()];
+        let mut comp = CompositeTextureSet::new(16, 16);
+        comp.composite_layers(&layers);
+
+        // BaseColor should blend via Normal (taking top layer's red)
+        let col = comp.base_color.get_pixel(8, 8);
+        assert!((col.x - 0.8).abs() < 1e-3, "BaseColor should be 0.8, got {}", col.x);
+        assert!((col.y - 0.1).abs() < 1e-3, "BaseColor should be 0.1, got {}", col.y);
+
+        // Height should blend via Add (0.3 + 0.4 = 0.7)
+        let h = comp.height_map.get_pixel(8, 8);
+        assert!((h - 0.7).abs() < 1e-3, "Height should be 0.7 via Add blend mode, got {}", h);
+
+        // Test channel opacities: reduce top layer's height opacity to 0.5
+        let mut layer_top_scaled = layer_top;
+        layer_top_scaled.set_channel_opacity(ChannelType::Height, 0.5);
+        let layers_scaled = vec![layers[0].clone(), layer_top_scaled];
+        comp.composite_layers(&layers_scaled);
+
+        // Height should blend via Add with half opacity: 0.3 + 0.4 * 0.5 = 0.5
+        let h_scaled = comp.height_map.get_pixel(8, 8);
+        assert!((h_scaled - 0.5).abs() < 1e-3, "Height should be 0.5 with 0.5 channel opacity, got {}", h_scaled);
+    }
+
+    #[test]
+    fn test_anchor_points_cross_layer_referencing() {
+        let mut layer_source = Layer::new_fill_layer(1, "SourceLayer".to_string(), 16, 16, Vec4::new(0.5, 0.5, 0.5, 1.0), 0.5, 0.0);
+        layer_source.fill_height = 0.75;
+        layer_source.evaluate_fill_advanced(None, None, None, None);
+        layer_source.anchor_point = Some("HeightAnchor".to_string());
+
+        let anchor_ref = layer_source.as_anchor_ref().expect("Expected anchor ref from layer_source");
+        let anchor_refs = [anchor_ref];
+
+        let mut layer_target = Layer::new_paint_layer(2, "TargetLayer".to_string(), 16, 16);
+        layer_target.add_white_mask();
+        layer_target.add_mask_anchor_effect("HeightAnchor".to_string(), ChannelType::Height);
+
+        // Evaluate mask with anchor point reference
+        layer_target.evaluate_mask_full(None, None, None, None, None, &anchor_refs);
+
+        // Target layer's mask should now equal the source layer's height channel (0.75)
+        let mask_val = layer_target.mask_buf.get_pixel(8, 8);
+        assert!((mask_val - 0.75).abs() < 1e-3, "Mask should reference height anchor value 0.75, got {}", mask_val);
+
+        // Test inverting the anchor reference
+        if let MaskEffectType::AnchorReference { ref mut invert, .. } = layer_target.mask_effects[0].effect_type {
+            *invert = true;
+        }
+        layer_target.evaluate_mask_full(None, None, None, None, None, &anchor_refs);
+        let inverted_val = layer_target.mask_buf.get_pixel(8, 8);
+        assert!((inverted_val - 0.25).abs() < 1e-3, "Inverted mask should equal 0.25 (1.0 - 0.75), got {}", inverted_val);
+    }
+
+    #[test]
+    fn test_color_selection_mask_from_id_map() {
+        let w = 16u32;
+        let h = 16u32;
+        let mut id_map = RgbaBuffer::new(w, h, Vec4::new(0.0, 1.0, 0.0, 1.0)); // Green base
+        for y in 0..h {
+            for x in 0..(w / 2) {
+                id_map.set_pixel(x, y, Vec4::new(1.0, 0.0, 0.0, 1.0)); // Red on left half
+            }
+        }
+
+        let mut layer = Layer::new_paint_layer(1, "ColorSelectTest".to_string(), w, h);
+        layer.add_black_mask();
+        layer.add_mask_color_selection_effect([1.0, 0.0, 0.0], 0.1, 0.05);
+
+        layer.evaluate_mask_full(None, None, None, None, Some(&id_map), &[]);
+
+        // Left half (red) should match color selection mask (~1.0)
+        let left_val = layer.mask_buf.get_pixel(2, 8);
+        assert!((left_val - 1.0).abs() < 1e-3, "Red region must be masked with 1.0, got {}", left_val);
+
+        // Right half (green) should not match color selection mask (0.0)
+        let right_val = layer.mask_buf.get_pixel(12, 8);
+        assert!(right_val < 1e-3, "Green region must not match red target color, got {}", right_val);
+    }
+
+    #[test]
+    fn test_selective_stroke_snapshot_zero_alloc() {
+        let mut layer = Layer::new_fill_layer(1, "TestLayer".to_string(), 64, 64, Vec4::ONE, 0.5, 0.0);
+        layer.add_white_mask();
+
+        // 1. Snapshot for Mask painting: material buffers should be zero-allocated (empty)
+        let mask_snapshot = layer.clone_stroke_snapshot_selective(Some(crate::brush::PaintTarget::Mask), None);
+        assert_eq!(mask_snapshot.base_color_buf.data.len(), 0);
+        assert_eq!(mask_snapshot.roughness_buf.data.len(), 0);
+        assert_eq!(mask_snapshot.metallic_buf.data.len(), 0);
+        assert_eq!(mask_snapshot.mask_buf.data.len(), 64 * 64);
+
+        // Mutate mask and restore
+        layer.mask_buf.set_pixel(5, 5, 0.0);
+        assert_eq!(layer.mask_buf.get_pixel(5, 5), 0.0);
+        layer.restore_stroke_snapshot(&mask_snapshot);
+        assert_eq!(layer.mask_buf.get_pixel(5, 5), 1.0);
+        // Base color should remain intact and non-empty
+        assert_eq!(layer.base_color_buf.data.len(), 64 * 64);
+
+        // 2. Snapshot for Material painting with base_color only: mask buffer should be zero-allocated
+        let mut flags = ChannelFlags::default();
+        flags.base_color = true;
+        flags.roughness = false;
+        flags.metallic = false;
+        let mat_snapshot = layer.clone_stroke_snapshot_selective(Some(crate::brush::PaintTarget::Material), Some(flags));
+        assert_eq!(mat_snapshot.base_color_buf.data.len(), 64 * 64);
+        assert_eq!(mat_snapshot.mask_buf.data.len(), 0);
+        assert_eq!(mat_snapshot.roughness_buf.data.len(), 0);
+    }
+
+    #[test]
+    fn test_folder_layer_zero_buffer_allocation() {
+        let folder = Layer::new_folder_layer(2, "FolderGroup".to_string(), 2048, 2048);
+        assert_eq!(folder.base_color_buf.data.len(), 0);
+        assert_eq!(folder.roughness_buf.data.len(), 0);
+        assert_eq!(folder.metallic_buf.data.len(), 0);
+        assert_eq!(folder.normal_buf.data.len(), 0);
+        assert_eq!(folder.mask_buf.data.len(), 0);
+        assert_eq!(folder.layer_type, LayerType::Folder);
+    }
+
+    #[test]
+    fn test_selective_dirty_channel_tracking() {
+        let mut layer = Layer::new_fill_layer(1, "Fill".to_string(), 32, 32, Vec4::ONE, 0.5, 0.0);
+        assert!(layer.dirty_flags.is_any());
+
+        // Clear dirty flags
+        layer.dirty_flags = LayerDirtyFlags::none();
+        layer.dirty_rect = None;
+        assert!(!layer.dirty_flags.is_any());
+
+        // Changing roughness only marks roughness dirty
+        layer.set_fill_roughness(0.2);
+        assert!(layer.dirty_flags.roughness);
+        assert!(!layer.dirty_flags.color);
+        assert!(!layer.dirty_flags.metallic);
+        assert!(layer.dirty_rect.is_some());
+    }
+
+    #[test]
+    fn test_procedural_mask_generators_evaluation() {
+        let w = 32;
+        let h = 32;
+
+        // Create synthetic mesh maps
+        let mut curv_map = ScalarBuffer::new(w, h, 0.5);
+        let mut ao_map = ScalarBuffer::new(w, h, 1.0);
+        let mut wn_map = RgbaBuffer::new(w, h, Vec4::new(0.5, 1.0, 0.5, 1.0)); // normal pointing up (+Y)
+        let mut pos_map = RgbaBuffer::new(w, h, Vec4::ZERO);
+
+        // Put an edge in curvature map (convex peak at x < 16)
+        for y in 0..h {
+            for x in 0..w {
+                if x < 16 {
+                    curv_map.set_pixel(x, y, 0.95);
+                    ao_map.set_pixel(x, y, 0.2); // deep cavity
+                } else {
+                    curv_map.set_pixel(x, y, 0.5);
+                    ao_map.set_pixel(x, y, 0.9);
+                }
+                let norm_y = if y < 16 { 1.0 } else { 0.0 }; // top half faces up (+Y)
+                wn_map.set_pixel(x, y, Vec4::new(0.5, norm_y * 0.5 + 0.5, 0.5, 1.0));
+                let height = y as f32 / h as f32;
+                pos_map.set_pixel(x, y, Vec4::new(0.0, height, 0.0, 1.0));
+            }
+        }
+
+        let mut layer = Layer::new_fill_layer(1, "TestGen".to_string(), w, h, Vec4::ONE, 0.5, 0.0);
+
+        // 1. Curvature Wear Generator
+        layer.add_black_mask();
+        layer.add_mask_generator_curvature_wear(Some(&curv_map), Some(&ao_map), Some(&pos_map), Some(&wn_map));
+        assert_eq!(layer.mask_effects.len(), 1);
+        let wear_edge = layer.mask_buf.get_pixel(4, 16);
+        let wear_flat = layer.mask_buf.get_pixel(24, 16);
+        assert!(wear_edge > wear_flat, "Curvature wear at edge ({}) must be greater than on flat ({})", wear_edge, wear_flat);
+
+        // 2. Cavity Dirt Generator
+        let mut layer2 = Layer::new_fill_layer(2, "TestCavity".to_string(), w, h, Vec4::ONE, 0.5, 0.0);
+        layer2.add_black_mask();
+        layer2.add_mask_generator_cavity_dirt(Some(&curv_map), Some(&ao_map), Some(&pos_map), Some(&wn_map));
+        let dirt_cavity = layer2.mask_buf.get_pixel(4, 16);
+        let dirt_exposed = layer2.mask_buf.get_pixel(24, 16);
+        assert!(dirt_cavity > dirt_exposed, "Cavity dirt in crevice ({}) must be greater than on open surface ({})", dirt_cavity, dirt_exposed);
+
+        // 3. Directional Dust Generator
+        let mut layer3 = Layer::new_fill_layer(3, "TestDust".to_string(), w, h, Vec4::ONE, 0.5, 0.0);
+        layer3.add_black_mask();
+        layer3.add_mask_generator_directional_dust(Some(&curv_map), Some(&ao_map), Some(&pos_map), Some(&wn_map));
+        let dust_top = layer3.mask_buf.get_pixel(16, 4);
+        let dust_side = layer3.mask_buf.get_pixel(16, 24);
+        assert!(dust_top > dust_side, "Directional dust on upward normal ({}) must exceed side normal ({})", dust_top, dust_side);
+
+        // 4. Ground Dirt Generator
+        let mut layer4 = Layer::new_fill_layer(4, "TestGround".to_string(), w, h, Vec4::ONE, 0.5, 0.0);
+        layer4.add_black_mask();
+        layer4.add_mask_generator_ground_dirt(Some(&curv_map), Some(&ao_map), Some(&pos_map), Some(&wn_map));
+        let mud_bottom = layer4.mask_buf.get_pixel(16, 2);
+        let mud_top = layer4.mask_buf.get_pixel(16, 30);
+        assert!(mud_bottom > mud_top, "Ground dirt at bottom ({}) must exceed high position ({})", mud_bottom, mud_top);
+
+        // 5. Mask Editor Compound Generator
+        let mut layer5 = Layer::new_fill_layer(5, "TestMaskEditor".to_string(), w, h, Vec4::ONE, 0.5, 0.0);
+        layer5.add_black_mask();
+        layer5.add_mask_generator_mask_editor(Some(&curv_map), Some(&ao_map), Some(&pos_map), Some(&wn_map));
+        assert!(layer5.mask_buf.data.iter().all(|&v| v >= 0.0 && v <= 1.0), "All mask editor values must be clamped within [0, 1]");
+    }
+
+    #[test]
+    fn test_composite_layers_rect_matches_full_compositing() {
+        let w = 64;
+        let h = 64;
+        let mut l1 = Layer::new_fill_layer(1, "Base Red".to_string(), w, h, Vec4::new(1.0, 0.0, 0.0, 1.0), 0.5, 0.0);
+        l1.evaluate_fill(None);
+
+        let mut l2 = Layer::new_paint_layer(2, "Stroke Blue".to_string(), w, h);
+        // Paint a blue patch in [10..=25, 12..=28]
+        for y in 12..=28 {
+            for x in 10..=25 {
+                l2.base_color_buf.set_pixel(x, y, Vec4::new(0.0, 0.0, 1.0, 1.0));
+                l2.roughness_buf.set_pixel(x, y, 0.2);
+                l2.metallic_buf.set_pixel(x, y, 0.8);
+            }
+        }
+        l2.dirty_rect = Some((10, 12, 25, 28));
+
+        let mut full_comp = CompositeTextureSet::new(w, h);
+        full_comp.composite_layers(&[l1.clone(), l2.clone()]);
+
+        let mut rect_comp = CompositeTextureSet::new(w, h);
+        rect_comp.composite_layers(&[l1.clone()]);
+        rect_comp.composite_layers_rect(&[l1.clone(), l2.clone()], 10, 12, 25, 28);
+
+        // Verify inside the rectangle: exact match with full composite
+        for y in 12..=28 {
+            for x in 10..=25 {
+                let full_col = full_comp.base_color.get_pixel(x, y);
+                let rect_col = rect_comp.base_color.get_pixel(x, y);
+                assert_eq!(full_col, rect_col, "Color mismatch at ({}, {})", x, y);
+                assert_eq!(full_comp.roughness.get_pixel(x, y), rect_comp.roughness.get_pixel(x, y));
+                assert_eq!(full_comp.metallic.get_pixel(x, y), rect_comp.metallic.get_pixel(x, y));
+            }
+        }
+
+        // Verify outside the rectangle: rect_comp retains base layer
+        assert_eq!(rect_comp.base_color.get_pixel(0, 0), Vec4::new(1.0, 0.0, 0.0, 1.0));
+        assert_eq!(rect_comp.base_color.get_pixel(50, 50), Vec4::new(1.0, 0.0, 0.0, 1.0));
+    }
+}
+
