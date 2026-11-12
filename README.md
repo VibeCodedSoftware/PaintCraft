@@ -11,7 +11,7 @@ PaintCraft is built on [3D Paintcraft](https://github.com/Ras-Maciej/3DPaintCraf
 
 ## Download
 
-Get the latest version from the [Releases page](https://github.com/DFairGamz/PaintCraft/releases/latest):
+Get the latest version from the [Releases page](https://github.com/VibeCodedSoftware/PaintCraft/releases/latest):
 
 | File | What it is |
 |---|---|
